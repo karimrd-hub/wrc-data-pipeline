@@ -1,0 +1,16 @@
+[project]
+name = "wrc-pipeline"
+version = "0.1.0"
+description = "Scrapy-based ingestion + transformation pipeline for workplacerelations.ie legal documents"
+readme = "README.md"
+authors = [
+    { name = "karimrd-hub", email = "karim.rmdn23@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "scrapy>=2.17.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
