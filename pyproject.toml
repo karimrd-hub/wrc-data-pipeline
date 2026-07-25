@@ -2,12 +2,18 @@
 name = "wrc-pipeline"
 version = "0.1.0"
 description = "Scrapy-based ingestion + transformation pipeline for workplacerelations.ie legal documents"
-readme = "README.md"
 authors = [
     { name = "karimrd-hub", email = "karim.rmdn23@gmail.com" }
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "beautifulsoup4>=4.13",
+    "dagster>=1.9,<2.0",
+    "dagster-webserver>=1.9,<2.0",
+    "lxml>=5.0",
+    "minio>=7.2.20",
+    "pymongo>=4.17.0",
+    "python-dotenv>=1.2.2",
     "scrapy>=2.17.0",
 ]
 

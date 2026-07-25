@@ -1,11 +1,14 @@
-# Scrapy settings for scrapers project
-#
-# For simplicity, this file contains only settings considered important or
-# commonly used. You can find more settings consulting the documentation:
-#
-#     https://docs.scrapy.org/en/latest/topics/settings.html
-#     https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
-#     https://docs.scrapy.org/en/latest/topics/spider-middleware.html
+# Scrapy settings — thin adapter over `wrc_pipeline.config.settings`.
+# Nothing here should be a magic number; if you need to tune a knob, do it in .env.
+
+from wrc_pipeline.config.settings import settings as _cfg
+from wrc_pipeline.logging_setup import install_json_root_logging
+
+# Install our JSON formatter on the root logger *before* Scrapy touches
+# logging. Combined with LOG_ENABLED=False below, this makes every log record
+# from Scrapy, twisted, MinIO, PyMongo and our own code come out as JSON
+# (task req 10).
+install_json_root_logging(_cfg.scraper.log_level)
 
 BOT_NAME = "wrc_pipeline"
 
@@ -14,74 +17,30 @@ NEWSPIDER_MODULE = "wrc_pipeline.scrapers.spiders"
 
 ADDONS = {}
 
-
-# Crawl responsibly by identifying yourself (and your website) on the user-agent
-#USER_AGENT = "scrapers (+http://www.yourdomain.com)"
-
-# Obey robots.txt rules
+# Obey robots.txt (recon §7.6 confirmed our targets are not disallowed).
 ROBOTSTXT_OBEY = True
 
-# Concurrency and throttling settings
-#CONCURRENT_REQUESTS = 16
-CONCURRENT_REQUESTS_PER_DOMAIN = 1
-DOWNLOAD_DELAY = 1
+# Concurrency + throttling (all env-driven).
+CONCURRENT_REQUESTS = _cfg.scraper.concurrent_requests
+CONCURRENT_REQUESTS_PER_DOMAIN = _cfg.scraper.concurrent_requests_per_domain
+DOWNLOAD_DELAY = _cfg.scraper.download_delay
+AUTOTHROTTLE_ENABLED = _cfg.scraper.autothrottle_enabled
+AUTOTHROTTLE_START_DELAY = 1.0
+AUTOTHROTTLE_MAX_DELAY = 10.0
+AUTOTHROTTLE_TARGET_CONCURRENCY = _cfg.scraper.autothrottle_target_concurrency
 
-# Disable cookies (enabled by default)
-#COOKIES_ENABLED = False
+# Retry idempotent failures a few times; site is IIS/ASP.NET, occasional 5xx expected.
+RETRY_ENABLED = True
+RETRY_TIMES = _cfg.scraper.retry_times
 
-# Disable Telnet Console (enabled by default)
-#TELNETCONSOLE_ENABLED = False
+# Do NOT let Scrapy reconfigure logging — we own the root handler above.
+LOG_ENABLED = False
 
-# Override the default request headers:
-#DEFAULT_REQUEST_HEADERS = {
-#    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#    "Accept-Language": "en",
-#}
+# Item pipelines. Single StoragePipeline owns hash + MinIO upload + Mongo upsert;
+# see wrc_pipeline.scrapers.pipelines for the idempotency contract.
+ITEM_PIPELINES = {
+    "wrc_pipeline.scrapers.pipelines.StoragePipeline": 300,
+}
 
-# Enable or disable spider middlewares
-# See https://docs.scrapy.org/en/latest/topics/spider-middleware.html
-#SPIDER_MIDDLEWARES = {
-#    "scrapers.middlewares.ScrapersSpiderMiddleware": 543,
-#}
-
-# Enable or disable downloader middlewares
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
-#DOWNLOADER_MIDDLEWARES = {
-#    "scrapers.middlewares.ScrapersDownloaderMiddleware": 543,
-#}
-
-# Enable or disable extensions
-# See https://docs.scrapy.org/en/latest/topics/extensions.html
-#EXTENSIONS = {
-#    "scrapy.extensions.telnet.TelnetConsole": None,
-#}
-
-# Configure item pipelines
-# See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-#ITEM_PIPELINES = {
-#    "scrapers.pipelines.ScrapersPipeline": 300,
-#}
-
-# Enable and configure the AutoThrottle extension (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/autothrottle.html
-#AUTOTHROTTLE_ENABLED = True
-# The initial download delay
-#AUTOTHROTTLE_START_DELAY = 5
-# The maximum download delay to be set in case of high latencies
-#AUTOTHROTTLE_MAX_DELAY = 60
-# The average number of requests Scrapy should be sending in parallel to
-# each remote server
-#AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
-# Enable showing throttling stats for every response received:
-#AUTOTHROTTLE_DEBUG = False
-
-# Enable and configure HTTP caching (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html#httpcache-middleware-settings
-#HTTPCACHE_ENABLED = True
-#HTTPCACHE_EXPIRATION_SECS = 0
-#HTTPCACHE_DIR = "httpcache"
-#HTTPCACHE_IGNORE_HTTP_CODES = []
-#HTTPCACHE_STORAGE = "scrapy.extensions.httpcache.FilesystemCacheStorage"
-
-# Set settings whose default value is deprecated to a future-proof value
+# Set settings whose default value is deprecated to a future-proof value.
 FEED_EXPORT_ENCODING = "utf-8"
