@@ -1,0 +1,14 @@
+.venv/
+.git/
+.gitignore
+.dockerignore
+.python-version
+.env
+.env.example
+docs/
+tests/
+**/__pycache__/
+*.pyc
+*.log
+v1.html
+v2.html
