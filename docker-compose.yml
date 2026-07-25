@@ -1,0 +1,96 @@
+# Local dev infra for the WRC pipeline.
+# Reviewer runbook: `docker compose up -d` — no .env editing required.
+# Every value has a sensible default; a .env at repo root overrides them.
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: wrc-mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio:
+    image: minio/minio:latest
+    container_name: wrc-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Dagit + scraper + transform, all in one image. UI at http://localhost:3000.
+  # Container names of ``mongo`` / ``minio`` are the internal service DNS names,
+  # so the app talks to them directly instead of through host port forwards.
+  app:
+    build: .
+    container_name: wrc-app
+    depends_on:
+      mongo:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${DAGSTER_PORT:-3000}:3000"
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: ${MONGO_DB:-wrc}
+      MONGO_LANDING_COLLECTION: ${MONGO_LANDING_COLLECTION:-landing_metadata}
+      MONGO_PROCESSED_COLLECTION: ${MONGO_PROCESSED_COLLECTION:-processed_metadata}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_SECURE: "false"
+      MINIO_LANDING_BUCKET: ${MINIO_LANDING_BUCKET:-landing-zone}
+      MINIO_PROCESSED_BUCKET: ${MINIO_PROCESSED_BUCKET:-processed}
+      SCRAPER_PARTITION_SIZE: ${SCRAPER_PARTITION_SIZE:-monthly}
+      SCRAPER_LOG_LEVEL: ${SCRAPER_LOG_LEVEL:-INFO}
+    restart: unless-stopped
+
+  # One-shot: waits for MinIO to be healthy, then creates the landing + processed
+  # buckets idempotently. Exits 0 when done. Not restarted.
+  minio-init:
+    image: minio/mc:latest
+    container_name: wrc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER:-minioadmin}" "$${MINIO_ROOT_PASSWORD:-minioadmin}" &&
+        mc mb --ignore-existing "local/$${MINIO_LANDING_BUCKET:-landing-zone}" &&
+        mc mb --ignore-existing "local/$${MINIO_PROCESSED_BUCKET:-processed}" &&
+        echo "buckets ready"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_LANDING_BUCKET: ${MINIO_LANDING_BUCKET:-landing-zone}
+      MINIO_PROCESSED_BUCKET: ${MINIO_PROCESSED_BUCKET:-processed}
+    restart: "no"
+
+volumes:
+  mongo_data:
+  minio_data:
