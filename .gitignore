@@ -41,3 +41,6 @@ data/
 # Docker bind-mount volumes (if used later)
 .mongo-data/
 .minio-data/
+
+# Local-only docs / notes / task spec
+docs/
