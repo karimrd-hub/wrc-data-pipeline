@@ -31,6 +31,10 @@ Single `file_hash`, single Mongo unique index, canonicalised payload.
 - **Transform warm-path fast bypass**: when `landing.file_hash == processed.source_file_hash` at the current `TRANSFORM_VERSION`, we skip MinIO get + BS4 clean + rehash entirely. Bumping `TRANSFORM_VERSION` forces a one-time reprocess when the cleaner contract changes. Measured 14× warm-run speedup.
 - **Pydantic validation gate** — `ProcessedRecord` validates every candidate before the upsert; failures route to `quarantine_metadata` with the reason attached, so a given identifier lives in exactly one of {processed, quarantine, neither}.
 
+## Data quality (beyond task spec)
+
+Every processed HTML/PDF also gets a plain-text sibling `{identifier}.txt` (BS4 for HTML, `pypdf` for PDF) written next to the archived original — the corpus becomes searchable/embeddable without re-parsing. `transform.extractor` parses the cleaned HTML for `chair`, `parties`, `hearing_date`, `acts_cited`, `monetary_amounts_eur` and related fields into `processed_metadata.structured`, turning the HTML blob into a queryable dataset. Both are best-effort — missing fields come back as `None`/`[]`, never raise.
+
 ## Scaling to 50+ sources
 
 Bodies are already configuration (`SCRAPER_BODIES`); sources need the same treatment plus platform-scale investments:
