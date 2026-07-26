@@ -164,11 +164,25 @@ class StoragePipeline:
         row_failures: dict[tuple[str, str], int] = getattr(
             spider, "partition_row_failures", {}
         )
-        keys = set(totals) | set(self.partition_stats) | set(row_failures)
+        # Spider-side HTTP-level failures (post-retry errbacks). Merged into
+        # ``failed`` so the found/scraped/failed equation reconciles from
+        # partition_summary alone; keys also enter the union so partitions
+        # whose first search-page died still appear in the summary stream
+        # (otherwise they'd vanish, having populated neither totals nor stats).
+        http_failures: dict[tuple[str, str], int] = getattr(
+            spider, "partition_http_failures", {}
+        )
+        keys = (
+            set(totals)
+            | set(self.partition_stats)
+            | set(row_failures)
+            | set(http_failures)
+        )
         for key in sorted(keys):
             body, partition_date = key
             counts = self.partition_stats.get(key, _new_partition_counter()).copy()
             counts["row_parse_failed"] = row_failures.get(key, 0)
+            counts["failed"] += http_failures.get(key, 0)
             found = totals.get(key, 0)
             scraped = counts["inserted"] + counts["updated"] + counts["unchanged"]
             self.log.info(

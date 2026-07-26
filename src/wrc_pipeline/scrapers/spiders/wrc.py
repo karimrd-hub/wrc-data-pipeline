@@ -63,6 +63,14 @@ class WrcSpider(scrapy.Spider):
         # so the found/scraped/failed equation reconciles from the summary
         # alone — not just from grepping record_failed events.
         self.partition_row_failures: dict[tuple[str, str], int] = {}
+        # (body_name, partition_date_iso) -> count of Requests that died after
+        # all retries (search-page or detail-page). Merged into
+        # partition_summary["failed"] by the pipeline at close_spider so the
+        # summary reconciles even when the failure happens outside the pipeline.
+        # Count is per-Request, not per-record: a failed search-page Request
+        # may represent up to RESULTS_PER_PAGE undelivered records — the
+        # accompanying record_failed event has the URL for exact reconciliation.
+        self.partition_http_failures: dict[tuple[str, str], int] = {}
 
     async def start(self):
         size = settings.scraper.partition_size
@@ -260,12 +268,25 @@ class WrcSpider(scrapy.Spider):
     def errback_request(self, failure):
         """Log any request that dies after retries so the reviewer can
         reconcile ``total_found`` against what actually reached the pipeline
-        (task req 10: failed downloads with URLs and error codes)."""
+        (task req 10: failed downloads with URLs and error codes).
+
+        Also bumps ``partition_http_failures`` so the pipeline can merge the
+        count into ``partition_summary["failed"]`` — otherwise HTTP failures
+        would only be findable via a record_failed grep and the summary would
+        leave ``found − scraped`` unaccounted-for.
+        """
         request = failure.request
         response = getattr(failure.value, "response", None)
         status = response.status if response is not None else None
         meta = request.meta or {}
         item = meta.get("item")
+        body_name = meta.get("body_name")
+        partition_date = meta.get("partition_date")
+        if body_name is not None and partition_date is not None:
+            key = (body_name, partition_date)
+            self.partition_http_failures[key] = (
+                self.partition_http_failures.get(key, 0) + 1
+            )
         self.logger.error(
             "record_failed",
             extra={
@@ -274,8 +295,8 @@ class WrcSpider(scrapy.Spider):
                 "status": status,
                 "error": type(failure.value).__name__,
                 "error_message": str(failure.value)[:300],
-                "body": meta.get("body_name"),
-                "partition_date": meta.get("partition_date"),
+                "body": body_name,
+                "partition_date": partition_date,
                 "identifier": item.get("identifier") if item else None,
             },
         )
