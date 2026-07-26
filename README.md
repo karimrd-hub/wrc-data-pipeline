@@ -1,157 +1,251 @@
 # WRC Data Pipeline
 
-Scrapy-based ingestion + BeautifulSoup transformation pipeline for
+A Scrapy-based ingestion and BeautifulSoup transformation pipeline for
 [workplacerelations.ie](https://www.workplacerelations.ie/en/search/?advance=true)
-legal decisions. Metadata is stored in MongoDB, raw and processed
-documents in MinIO. Dagster orchestrates ingest → transform with an
-explicit partition dependency.
+legal decisions. Metadata lands in MongoDB, raw and cleaned documents in
+MinIO, orchestrated by Dagster. Every artifact and knob is reproducible
+from `docker compose up`.
 
-Target volume: 500–1000 documents (task spec); designed for 1000× headroom
-per the scaling notes in [ARCHITECTURE.md](ARCHITECTURE.md).
+Target volume per the task spec: 500–1 000 documents. Designed for
+1 000× that; see [ARCHITECTURE.md](ARCHITECTURE.md) for the scaling
+levers and empirical validation.
 
 ---
 
-## Quick start (Docker, recommended)
+## Highlights
 
-Prerequisites: Docker + Docker Compose.
+- **Ingest** — Scrapy spider crawling all four WRC tribunals (Equality
+  Tribunal, Employment Appeals Tribunal, Labour Court, WRC), partitioned
+  by `(month × body)`. Downloads PDF/DOC as-is; HTML detail pages
+  archived verbatim. Structured JSON logging with per-partition
+  reconciliation (`found = scraped + failed + row_parse_failed`).
+- **Transform** — Cleans HTML to relevant-content only, passes PDF
+  through, renames to `identifier.ext`, writes to a separate bucket and
+  collection. Ships three data-quality extras on top of the task spec:
+  plain-text sibling for search/embedding, structured field extraction,
+  pydantic validation gate with quarantine on failure.
+- **Idempotency** — Canonicalised HTML + SHA-256 hash + Mongo unique
+  index on `identifier`. Warm re-runs hit a source-hash fast path that
+  skips MinIO + re-cleaning — measured **14× speedup** on the transform
+  warm path.
+- **Orchestration** — Dagster `MultiPartitionsDefinition({date × body})`
+  with `QueuedRunCoordinator` fanning parallel Scrapy subprocesses.
+  Shipped defaults sustain **~601 records/min** at aggregate ~84
+  concurrent (validated: `bench/results/ymb_3yr_4bodies_c12t7`).
+- **Config-driven** — Every numeric knob lives in `.env`; no hardcoded
+  values in code. Ships fast, dials down easy.
 
-```bash
-docker compose up --build -d
+---
+
+## Project layout
+
+```
+wrc-data-pipeline/
+├── src/wrc_pipeline/
+│   ├── scrapers/               Scrapy project
+│   │   ├── spiders/wrc.py      single-body WRC spider
+│   │   ├── pipelines.py        canonicalize → hash → MinIO → Mongo
+│   │   ├── items.py            WrcItem — every task-required field
+│   │   └── utils/              date partitioning, body-id mapping
+│   ├── transform/              landing → processed transformer
+│   │   ├── cleaner.py          BS4 relevant-content extractor
+│   │   ├── extractor.py        structured fields (chair, parties, acts, …)
+│   │   ├── text.py             plain-text sibling (BS4 + pypdf)
+│   │   ├── validation.py       pydantic gate + quarantine builder
+│   │   ├── runner.py           batched-write runner, warm-path fast bypass
+│   │   └── cli.py              `python -m wrc_pipeline.transform`
+│   ├── orchestration/          Dagster assets + partitions
+│   ├── storage/                Mongo + MinIO clients, hashing helpers
+│   ├── config/settings.py      typed env-driven settings singleton
+│   └── logging_setup.py        JSON root logger (task req 10)
+├── tests/                      25 pytest tests, one per task req + extras
+├── bench/                      benchmark harness + committed milestone results
+│   ├── run.sh                  fixed-workload cold/warm benchmark
+│   ├── run-parallel.sh         year-per-worker parallel harness
+│   ├── run-parallel-yb.sh      (year × body)-per-worker harness
+│   ├── run-parallel-ymb.sh     (year × month × body) with concurrency cap
+│   ├── probe-pagesize.sh       checks WRC for a page-size override
+│   ├── summarize-parallel*.py  markdown-summary generators
+│   └── results/<label>/        summary.md + wall-time files
+├── docker-compose.yml          mongo, minio, dagster (web + daemon), mongo-express
+├── Dockerfile                  multi-stage python:3.11-slim + uv
+├── dagster.yaml                QueuedRunCoordinator config
+├── ARCHITECTURE.md             partition size · retries · dedup · 50+ sources
+├── .env.example                every tunable + default
+└── pyproject.toml              deps + pytest config
 ```
 
-That boots four containers: `mongo`, `minio`, `minio-init` (creates the
-buckets, exits), and `app` (Dagit + code). When the containers are healthy:
+---
 
-- **Dagit UI** — [http://localhost:3000](http://localhost:3000)
-- **MinIO console** — [http://localhost:9001](http://localhost:9001) (login: `minioadmin` / `minioadmin`)
-- **Mongo** — `mongodb://localhost:27017`
+## Quick start — Docker (recommended)
 
-Materialize a partition from Dagit:
+Prerequisites: Docker Desktop or docker-compose v2. No `.env` editing
+required for a first run.
 
-1. Open the **Assets** tab.
-2. Select both `landing_records` and `processed_records`.
-3. Click **Materialize selected**.
-4. Pick a partition (any month, e.g. `2026-01-01`) and confirm.
+```bash
+docker compose up -d --build
+```
 
-Dagster runs the scraper first, then the transform. All the pipeline's
-own log lines are JSON — you can watch them in the run log or `docker
-compose logs -f app`.
+Boots six containers:
 
-To stop everything and wipe state:
+| Container | Purpose |
+|---|---|
+| `wrc-mongo` | MongoDB — landing + processed + quarantine collections |
+| `wrc-minio` | S3-compatible object storage |
+| `wrc-minio-init` | One-shot bucket creation, exits |
+| `wrc-dagster-webserver` | Dagit UI + asset execution |
+| `wrc-dagster-daemon` | Dequeues + launches queued runs |
+| `wrc-mongo-express` | Web browser for Mongo (dev convenience) |
+
+Web UIs (all local):
+
+| Service | URL | Credentials |
+|---|---|---|
+| Dagit (orchestrator) | http://localhost:3000 | — |
+| MinIO Console | http://localhost:9001 | `minioadmin` / `minioadmin` |
+| Mongo Express | http://localhost:8081 | `admin` / `admin` |
+
+Stop and wipe all state:
 
 ```bash
 docker compose down -v
 ```
 
-## Direct CLI (no Dagster)
+---
 
-Same pipeline, invoked directly. Useful for tight iteration cycles or
-when the reviewer wants to script it.
+## Alternative — uv (local development)
 
-Prerequisites: Python 3.11 + [`uv`](https://docs.astral.sh/uv/), then start
-just the storage services from compose:
+Prerequisites: Python 3.11 and [`uv`](https://docs.astral.sh/uv/).
+Start only the backing services from compose and run the pipeline
+directly with uv:
 
 ```bash
 docker compose up -d mongo minio minio-init
 uv sync
 ```
 
-Then either step, independently:
+`SCRAPY_SETTINGS_MODULE=wrc_pipeline.scrapers.settings` is inferred
+from `scrapy.cfg`; no shell exports needed.
+
+---
+
+## Triggering the pipeline
+
+### Dagster UI (recommended)
+
+1. Open http://localhost:3000
+2. **Assets** tab → select `landing_records` and `processed_records`
+3. Click **Materialize selected**
+4. Pick a partition (e.g. `date=2024-01-01 / body=labour_court`) or a
+   range, then confirm
+
+Dagster runs the scraper subprocess first (`landing_records`), then the
+transformer (`processed_records`) on the same partition — dependency
+wired via `deps=[landing_records]`. Up to
+`DAGSTER_MAX_CONCURRENT_RUNS=12` partitions materialize in parallel.
+JSON log lines land in the Dagit run log and in
+`docker compose logs -f dagster-webserver`.
+
+### CLI (tight iteration)
+
+Same code, invoked directly. Assumes storage services already up.
 
 ```bash
-# Ingest — spider writes to landing bucket + landing_metadata
+# Ingest — writes to landing_metadata + landing bucket
 uv run scrapy crawl wrc \
-    -a start_date=2026-01-01 -a end_date=2026-01-31 \
+    -a start_date=2024-01-01 -a end_date=2024-01-31 \
     -a bodies=3
 
-# Transform — cleans landing HTML → writes to processed bucket + processed_metadata
+# Transform — cleans HTML, extracts structured fields, quarantines invalid rows
 uv run python -m wrc_pipeline.transform \
-    --start-date 2026-01-01 --end-date 2026-01-31 \
+    --start-date 2024-01-01 --end-date 2024-01-31 \
     --bodies 3
 ```
 
-`bodies=` is optional; omit to scrape all four (Labour Court, WRC,
-Equality Tribunal, EAT). Both commands are idempotent — re-running the
-same range writes zero new bytes.
+`-a bodies=` / `--bodies` are optional; omit to scrape all four
+tribunals. Both commands are idempotent — a warm re-run over the same
+range writes zero new bytes.
+
+---
 
 ## Configuration
 
-Everything is env-driven. Copy `.env.example` to `.env` and edit if you
-need to. Real shell env vars override `.env`. Shipped defaults match our
-fastest validated config (`bench/results/ymb_3yr_4bodies_c12t7`,
-601 rec/min at aggregate ~84); the safer reference-implementation config
-(aggregate ~16) is one env-var edit — `DAGSTER_MAX_CONCURRENT_RUNS=2`,
-`SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY=4.0` — if the site tightens
-throttling. See `.env.example` for the full list; the ones you're most
-likely to touch:
+Every tunable is env-driven. Copy `.env.example` to `.env` if you need
+to override defaults; shell env wins over `.env` values.
+
+Shipped defaults match our fastest empirically-validated config
+(`bench/results/ymb_3yr_4bodies_c12t7` — 601 records/min at aggregate
+~84 concurrent with zero HTTP errors). If the target site tightens
+throttling, roll back to the safer reference-implementation config
+with two overrides:
+
+```bash
+DAGSTER_MAX_CONCURRENT_RUNS=2 SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY=4.0 \
+    docker compose up -d
+```
+
+Most-touched vars:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SCRAPER_PARTITION_SIZE` | `monthly` | `monthly` / `weekly` / `daily` — spider's own partition granularity (independent of Dagster). |
-| `SCRAPER_CONCURRENT_REQUESTS` | `32` | Global concurrency ceiling for Scrapy. |
-| `SCRAPER_AUTOTHROTTLE_ENABLED` | `true` | Safety belt — auto-backs off on 5xx or slow responses. |
-| `MONGO_URI` | `mongodb://localhost:27017` | Overridden to `mongodb://mongo:27017` inside the app container. |
-| `MINIO_ENDPOINT` | `localhost:9000` | Overridden to `minio:9000` inside the app container. |
+| `SCRAPER_PARTITION_SIZE` | `monthly` | `monthly` / `weekly` / `daily` |
+| `SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY` | `7.0` | Per-process average concurrent requests |
+| `DAGSTER_MAX_CONCURRENT_RUNS` | `12` | Parallel Scrapy subprocesses |
+| `MONGO_URI` / `MINIO_ENDPOINT` | container defaults | Override to point at external services |
 
-## Layout
+See [`.env.example`](.env.example) for the full annotated list.
 
-```
-src/wrc_pipeline/
-├── scrapers/         # Scrapy spider, item, pipeline, dates + bodies utils
-├── transform/        # BS4 cleaner, transform runner, CLI
-├── orchestration/    # Dagster asset definitions
-├── storage/          # Mongo + MinIO clients + hashing helpers
-├── config/           # Typed env-driven settings singleton
-└── logging_setup.py  # JSON root logger (task req 10)
-```
+---
 
-Design decisions and their rationales live in `docs/decisions.md`;
-task requirements in `docs/task.md`.
+## Tests
 
-## Verification
-
-End-to-end smoke test (Labour Court, January 2026 = 40 records):
+25 pytest tests. One group traces each numbered `docs/task.md`
+requirement to a green/red signal; the other exercises the
+data-quality extras (structured extraction, text sibling, pydantic
+gate).
 
 ```bash
-docker compose up -d mongo minio minio-init
-uv sync
-
-uv run scrapy crawl wrc -a start_date=2026-01-01 -a end_date=2026-01-31 -a bodies=3
-uv run python -m wrc_pipeline.transform --start-date 2026-01-01 --end-date 2026-01-31 --bodies 3
-
-# Re-run: expect all 40 unchanged, zero MinIO puts
-uv run scrapy crawl wrc -a start_date=2026-01-01 -a end_date=2026-01-31 -a bodies=3
-uv run python -m wrc_pipeline.transform --start-date 2026-01-01 --end-date 2026-01-31 --bodies 3
-```
-
-Unit tests (25 tests, one per task requirement plus data-quality extras):
-
-```bash
+# via uv locally
 uv sync --group dev
 uv run pytest tests/
+
+# or inside the runtime container
+docker compose run --rm --no-deps \
+    -v $(pwd)/tests:/app/tests -v $(pwd)/data:/app/data \
+    dagster-webserver \
+    bash -c "pip install pytest --quiet && cd /app && pytest tests/ -v"
 ```
+
+---
 
 ## Benchmarks
 
-Reproducible benchmark harness under `bench/`, isolated from real state
-via a dedicated Mongo DB (`wrc_bench`) and MinIO buckets. Each run writes
-JSON logs + a `summary.md` to `bench/results/<label>/` for committable
-evidence. Full docs in `bench/README.md`. Milestone results in the repo:
+Reproducible harness in [`bench/`](bench/) with committed milestone
+results:
 
 | label | shape | records | wall | rec/min |
 |---|---|---|---|---|
-| `t8` | 5yr LC only, target=8 | 2171 | 7:26 | 292 |
-| `par_t16` | 5yr LC only, target=16, 5 workers | 2170 | 3:22 | 644 |
-| `ymb_3yr_4bodies_c12t7` | 3yr × 4 bodies × 12 months, 144 workers cap=12, target=7 | 9025 | 15:01 | 601 |
+| `t8` | 5-year Labour Court, target=8, 5 workers | 2 171 | 7:26 | 292 |
+| `par_t16` | 5-year Labour Court, target=16, 5 workers | 2 170 | 3:22 | 644 |
+| `ymb_3yr_4bodies_c12t7` | 3y × 4 bodies × 12 months, cap=12, target=7 | **9 025** | **15:01** | **601** |
 
-The `ymb_*` harness (`bench/run-parallel-ymb.sh`) is the mode that
-matches Dagster's fanout most closely: one Scrapy subprocess per
-`(year × month × body)`, joined by `wait` inside a single
-`docker compose run` invocation, with a concurrency cap so aggregate
-WRC load stays bounded regardless of partition count.
+Full commentary and conclusions: [`bench/README.md`](bench/README.md).
+
+---
 
 ## Troubleshooting
 
-- **Docker BuildKit / uv wheel errors** — the base image is `python:3.11-slim`; if the build stalls on `lxml`, delete `.venv/` and retry with `docker compose build --no-cache app`.
-- **`Address already in use` on 3000 / 27017 / 9000 / 9001** — set `DAGSTER_PORT`, `MONGO_HOST_PORT`, `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` in `.env`.
-- **Dagit shows 0 partitions materialized after a run** — the run log usually has the actual error; look for a `record_failed` JSON line or a non-zero exit code from the `landing_records` op.
+- **`docker compose build` fails on `ghcr.io/astral-sh/uv` with a
+  credential-helper error** — Docker Desktop on WSL is calling the
+  Windows credential store from a non-interactive shell. Back up your
+  Docker config and retry:
+  ```bash
+  mv ~/.docker/config.json ~/.docker/config.json.bak
+  docker compose up -d --build
+  ```
+- **`Address already in use` on 3000 / 27017 / 9000 / 9001 / 8081** —
+  set the corresponding `*_PORT` env var (see `.env.example`).
+- **Dagit shows 0 partitions materialised after a run** — the run log
+  has the reason; look for a `record_failed` JSON event or a non-zero
+  exit code on the `landing_records` op.
+- **Want to reduce load on WRC** — see the safer-dial-back preset above.

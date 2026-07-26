@@ -121,6 +121,23 @@ services:
       - -m
       - wrc_pipeline.orchestration
 
+  # Web UI for MongoDB — browse landing_metadata / processed_metadata / quarantine_metadata
+  # without leaving the browser. Auth defaults are dev-only.
+  mongo-express:
+    image: mongo-express:latest
+    container_name: wrc-mongo-express
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_PORT: "27017"
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:-admin}
+    restart: unless-stopped
+
   # One-shot: waits for MinIO to be healthy, then creates the landing + processed
   # buckets idempotently. Exits 0 when done. Not restarted.
   minio-init:
