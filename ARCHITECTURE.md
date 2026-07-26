@@ -30,7 +30,7 @@ individual runs short and re-runnable; weekly is a middle ground.
 
 - **AutoThrottle** (`SCRAPER_AUTOTHROTTLE_ENABLED=true`) is the primary
   throughput lever. Start delay `0.25 s`, max `10 s`, target concurrency
-  `8`; delay adapts per-slot as `latency / target_concurrency`, so it
+  `7`; delay adapts per-slot as `latency / target_concurrency`, so it
   backs off automatically when WRC's response time climbs.
 - **Fixed ceilings**: `CONCURRENT_REQUESTS=16`,
   `CONCURRENT_REQUESTS_PER_DOMAIN=16`. AutoThrottle grows into these but
@@ -50,6 +50,11 @@ individual runs short and re-runnable; weekly is a middle ground.
   **zero retries, zero `record_failed`, zero 5xx** across 2170 records —
   well past the reference-implementation's claimed "a few concurrent"
   ceiling.
+- **Ships fast, dials down easy**: shipped defaults (target=7,
+  `DAGSTER_MAX_CONCURRENT_RUNS=12`, aggregate ~84) match our fastest
+  validated config (`ymb_3yr_4bodies_c12t7`, 601 rec/min); the safer
+  reference-implementation config (aggregate ~16) is one env-var edit
+  away if the site tightens throttling.
 
 ## Deduplication
 

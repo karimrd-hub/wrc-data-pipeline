@@ -77,8 +77,13 @@ same range writes zero new bytes.
 ## Configuration
 
 Everything is env-driven. Copy `.env.example` to `.env` and edit if you
-need to. Real shell env vars override `.env`. See `.env.example` for the
-full list; the ones you're most likely to touch:
+need to. Real shell env vars override `.env`. Shipped defaults match our
+fastest validated config (`bench/results/ymb_3yr_4bodies_c12t7`,
+601 rec/min at aggregate ~84); the safer reference-implementation config
+(aggregate ~16) is one env-var edit — `DAGSTER_MAX_CONCURRENT_RUNS=2`,
+`SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY=4.0` — if the site tightens
+throttling. See `.env.example` for the full list; the ones you're most
+likely to touch:
 
 | Var | Default | Meaning |
 |---|---|---|

@@ -155,7 +155,7 @@ class ScraperSettings:
             autothrottle_enabled=_bool("SCRAPER_AUTOTHROTTLE_ENABLED", True),
             autothrottle_start_delay=_float("SCRAPER_AUTOTHROTTLE_START_DELAY", 0.25),
             autothrottle_max_delay=_float("SCRAPER_AUTOTHROTTLE_MAX_DELAY", 10.0),
-            autothrottle_target_concurrency=_float("SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY", 4.0),
+            autothrottle_target_concurrency=_float("SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY", 7.0),
             retry_times=_int("SCRAPER_RETRY_TIMES", 5),
             partition_size=partition_size,
             log_level=_str("SCRAPER_LOG_LEVEL", "INFO").upper(),
