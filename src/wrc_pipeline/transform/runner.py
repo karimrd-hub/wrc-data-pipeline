@@ -290,7 +290,7 @@ class TransformRunner:
                     "bucket": settings.minio.landing_bucket,
                     "error": type(exc).__name__,
                     "s3_code": exc.code,
-                    "message": str(exc)[:200],
+                    "error_message": str(exc)[:200],
                 },
             )
             return
@@ -310,7 +310,7 @@ class TransformRunner:
                     extra={
                         "landing_path": landing_path,
                         "raw_size": len(raw),
-                        "message": str(exc)[:200],
+                        "error_message": str(exc)[:200],
                     },
                 )
                 return
@@ -360,7 +360,7 @@ class TransformRunner:
                 identifier=identifier,
                 landing_record=record,
                 reason="schema_validation_failed",
-                details={"errors": exc.errors(include_url=False)},
+                details={"errors": exc.errors(include_url=False, include_context=False)},
                 now=now,
             )
             return
@@ -407,7 +407,7 @@ class TransformRunner:
                     "payload_size": len(payload),
                     "error": type(exc).__name__,
                     "s3_code": exc.code,
-                    "message": str(exc)[:200],
+                    "error_message": str(exc)[:200],
                 },
             )
             return
@@ -520,7 +520,7 @@ class TransformRunner:
                         "reason": "processed_bulk_write_failed",
                         "index": err.get("index"),
                         "code": err.get("code"),
-                        "message": (err.get("errmsg") or "")[:200],
+                        "error_message": (err.get("errmsg") or "")[:200],
                     },
                 )
 
@@ -557,7 +557,7 @@ class TransformRunner:
                     "identifier": identifier,
                     "reason": reason,
                     "error": type(exc).__name__,
-                    "message": str(exc)[:200],
+                    "error_message": str(exc)[:200],
                 },
             )
         self.stats.bump(landing_record.get("body") or "?",

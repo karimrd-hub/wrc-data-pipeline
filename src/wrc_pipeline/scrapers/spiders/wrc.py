@@ -135,7 +135,10 @@ class WrcSpider(scrapy.Spider):
                 title = (title_a.css("::text").get() or "").strip()
                 # refNO is the canonical id but is occasionally empty in the source HTML
                 # (observed on Labour Court page 4 for 2026-01). Fall back to h2 text.
-                identifier = (row.css("span.refNO::text").get() or "").strip() or title
+                # Strip internal whitespace: WRC occasionally emits identifiers like
+                # "IR - SC - 00003431"; validator + object-key format both reject spaces.
+                raw_identifier = (row.css("span.refNO::text").get() or "").strip() or title
+                identifier = re.sub(r"\s+", "", raw_identifier)
                 detail_href = (title_a.attrib.get("href") or "").strip()
                 description = " ".join(
                     t.strip() for t in row.css("p.description::text").getall() if t.strip()
