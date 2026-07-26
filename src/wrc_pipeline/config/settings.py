@@ -137,8 +137,6 @@ class ScraperSettings:
                 f"got {partition_size!r}"
             )
         return cls(
-            # Defaults aligned with the reference repo; see
-            # docs/performance-baseline.md for the shelved aggressive numbers.
             concurrent_requests=_int("SCRAPER_CONCURRENT_REQUESTS", 16),
             concurrent_requests_per_domain=_int("SCRAPER_CONCURRENT_REQUESTS_PER_DOMAIN", 16),
             download_delay=_float("SCRAPER_DOWNLOAD_DELAY", 0.0),

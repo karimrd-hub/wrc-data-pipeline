@@ -54,10 +54,9 @@ _SUBPROCESS_TIMEOUT_SEC = 3600
 BODY_SLUGS: dict[str, int] = {body_slug(name): bid for bid, name in BODIES.items()}
 
 
-# Monthly partitions matching the reference repo. Weekly was tried (see
-# docs/performance-baseline.md) but per-subprocess startup overhead ate the
-# parallelism benefit at the reference test volume. Monthly amortizes
-# subprocess startup across more per-partition work.
+# Monthly partitions. Weekly was tried but per-subprocess startup overhead
+# ate the parallelism benefit at the 500-1000-doc test volume; monthly
+# amortizes subprocess startup across more per-partition work.
 _MONTHLY = dg.MonthlyPartitionsDefinition(start_date=settings.dagster.partition_start_date)
 _BODIES = dg.StaticPartitionsDefinition(sorted(BODY_SLUGS))
 _PARTITIONS = dg.MultiPartitionsDefinition({"date": _MONTHLY, "body": _BODIES})
