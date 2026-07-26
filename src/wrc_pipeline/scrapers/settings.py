@@ -32,9 +32,49 @@ AUTOTHROTTLE_TARGET_CONCURRENCY = _cfg.scraper.autothrottle_target_concurrency
 # Retry idempotent failures a few times; site is IIS/ASP.NET, occasional 5xx expected.
 RETRY_ENABLED = True
 RETRY_TIMES = _cfg.scraper.retry_times
+# Scrapy's default retry list omits 403 and the 520–524 range. Our own
+# load testing against WRC showed that when the server pushes back it
+# tends to do so with 403 (WAF-style challenge) or one of the
+# 520–524 origin/edge errors — treating those as terminal record_failed
+# events would strand recoverable records. Retrying lets AutoThrottle
+# back off and the request succeed on a subsequent attempt.
+RETRY_HTTP_CODES = [403, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]
 
 # Do NOT let Scrapy reconfigure logging — we own the root handler above.
 LOG_ENABLED = False
+
+# --- Anti-fingerprint hygiene ------------------------------------------------
+# Internal load testing showed the WRC server is more prone to blocking
+# static-fingerprint clients under sustained load. Three layers work
+# together so requests look like a real browser session at the WAF layer:
+#
+#   1. Random User-Agent per request — see ``RotatingUserAgentMiddleware``
+#      (wired below; pool lives in ``config.settings``).
+#   2. Realistic default headers — ``DEFAULT_REQUEST_HEADERS`` below.
+#   3. Retry on the Cloudflare block/edge-error family — ``RETRY_HTTP_CODES``
+#      above.
+
+DOWNLOADER_MIDDLEWARES = {
+    # Disable Scrapy's static UA middleware — the rotator replaces it.
+    "scrapy.downloadermiddlewares.useragent.UserAgentMiddleware": None,
+    "wrc_pipeline.scrapers.middlewares.RotatingUserAgentMiddleware": 543,
+}
+
+# Header shape a real browser sends on a top-level navigation. Values are
+# intentionally not per-request-randomised — a browser doesn't randomise
+# them either, and stability on these headers plus rotation on User-Agent
+# is what a genuine "different user, different session" fingerprint looks
+# like. ``Accept-Language`` is Ireland-first to match the target audience.
+DEFAULT_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IE,en-GB;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "DNT": "1",
+}
 
 # Item pipelines. Single StoragePipeline owns hash + MinIO upload + Mongo upsert;
 # see wrc_pipeline.scrapers.pipelines for the idempotency contract.

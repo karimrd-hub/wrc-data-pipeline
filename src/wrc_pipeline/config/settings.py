@@ -42,6 +42,22 @@ def _bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _pipe_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse a pipe-separated list from the env, falling back to ``default``.
+
+    Pipe was chosen as the separator because real User-Agent strings
+    contain commas, semicolons and parentheses but never pipes, so no
+    escaping is needed. Empty entries are dropped.
+    """
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    items = tuple(a.strip() for a in v.split("|") if a.strip())
+    if not items:
+        raise ValueError(f"{name} parsed to an empty list")
+    return items
+
+
 def _bodies(name: str, default: dict[int, str]) -> dict[int, str]:
     """Parse a ``SCRAPER_BODIES``-style value: comma-separated ``id:Name`` pairs.
 
@@ -74,6 +90,22 @@ _DEFAULT_BODIES: dict[int, str] = {
     3: "Labour Court",
     15376: "Workplace Relations Commission",
 }
+
+
+# Built-in User-Agent pool. Every outgoing request is stamped with a random
+# choice from this tuple by ``RotatingUserAgentMiddleware`` — internal load
+# testing showed that a static UA correlated with server-side blocking on
+# sustained crawls. Six-agent pool spans current desktop Chrome / Edge /
+# Safari / Firefox on Windows / macOS / Linux; extend or replace via the
+# ``SCRAPER_USER_AGENT_POOL`` env var (pipe-separated).
+_DEFAULT_USER_AGENT_POOL: tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.2739.79",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +171,7 @@ class ScraperSettings:
     partition_size: str
     log_level: str
     bodies: dict[int, str]
+    user_agent_pool: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "ScraperSettings":
@@ -149,17 +182,18 @@ class ScraperSettings:
                 f"got {partition_size!r}"
             )
         return cls(
-            concurrent_requests=_int("SCRAPER_CONCURRENT_REQUESTS", 16),
-            concurrent_requests_per_domain=_int("SCRAPER_CONCURRENT_REQUESTS_PER_DOMAIN", 16),
+            concurrent_requests=_int("SCRAPER_CONCURRENT_REQUESTS", 8),
+            concurrent_requests_per_domain=_int("SCRAPER_CONCURRENT_REQUESTS_PER_DOMAIN", 8),
             download_delay=_float("SCRAPER_DOWNLOAD_DELAY", 0.0),
             autothrottle_enabled=_bool("SCRAPER_AUTOTHROTTLE_ENABLED", True),
             autothrottle_start_delay=_float("SCRAPER_AUTOTHROTTLE_START_DELAY", 0.25),
             autothrottle_max_delay=_float("SCRAPER_AUTOTHROTTLE_MAX_DELAY", 10.0),
-            autothrottle_target_concurrency=_float("SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY", 7.0),
+            autothrottle_target_concurrency=_float("SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY", 4.0),
             retry_times=_int("SCRAPER_RETRY_TIMES", 5),
             partition_size=partition_size,
             log_level=_str("SCRAPER_LOG_LEVEL", "INFO").upper(),
             bodies=_bodies("SCRAPER_BODIES", _DEFAULT_BODIES),
+            user_agent_pool=_pipe_list("SCRAPER_USER_AGENT_POOL", _DEFAULT_USER_AGENT_POOL),
         )
 
 

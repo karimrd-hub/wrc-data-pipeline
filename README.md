@@ -173,24 +173,41 @@ range writes zero new bytes.
 Every tunable is env-driven. Copy `.env.example` to `.env` if you need
 to override defaults; shell env wins over `.env` values.
 
-Shipped defaults match our fastest empirically-validated config
-(`bench/results/ymb_3yr_4bodies_c12t7` — 601 records/min at aggregate
-~84 concurrent with zero HTTP errors). If the target site tightens
-throttling, roll back to the safer reference-implementation config
-with two overrides:
+Shipped defaults keep aggregate WRC-domain load near **~16 concurrent**
+requests — the conservative posture our internal load testing settled
+on after observing that more aggressive configurations (aggregate ~80+)
+were faster on isolated benchmark runs but drew server-side blocking
+on sustained crawls. Concretely: `AUTOTHROTTLE_TARGET_CONCURRENCY=4`
+per process × `DAGSTER_MAX_CONCURRENT_RUNS=4` parallel subprocesses.
+The faster configurations remain reproducible via the bench harness
+for headroom testing; we simply don't ship them.
+
+If the site tightens throttling further, roll back with:
 
 ```bash
-DAGSTER_MAX_CONCURRENT_RUNS=2 SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY=4.0 \
+DAGSTER_MAX_CONCURRENT_RUNS=2 SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
     docker compose up -d
 ```
+
+Anti-fingerprint hygiene ships enabled by default: a
+`RotatingUserAgentMiddleware` stamps every outgoing request with a
+random UA from a pool of six realistic desktop-browser strings; a
+browser-shaped set of default headers (`Accept-Language: en-IE`,
+`Upgrade-Insecure-Requests`, the `Sec-Fetch-*` quartet, `DNT`) sits on
+every request; and the retry list is extended to include 403 plus the
+520–524 origin/edge-error family so WAF challenges are treated as
+transient rather than terminal.
 
 Most-touched vars:
 
 | Var | Default | Meaning |
 |---|---|---|
 | `SCRAPER_PARTITION_SIZE` | `monthly` | `monthly` / `weekly` / `daily` |
-| `SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY` | `7.0` | Per-process average concurrent requests |
-| `DAGSTER_MAX_CONCURRENT_RUNS` | `12` | Parallel Scrapy subprocesses |
+| `SCRAPER_CONCURRENT_REQUESTS` | `8` | Hard ceiling on in-flight requests (2× above target — bounds AutoThrottle bursts) |
+| `SCRAPER_CONCURRENT_REQUESTS_PER_DOMAIN` | `8` | Same, per-domain |
+| `SCRAPER_AUTOTHROTTLE_TARGET_CONCURRENCY` | `4.0` | Per-process average concurrent requests |
+| `DAGSTER_MAX_CONCURRENT_RUNS` | `4` | Parallel Scrapy subprocesses |
+| `SCRAPER_USER_AGENT_POOL` | built-in 6-UA pool | Pipe-separated override for the UA rotation pool |
 | `MONGO_URI` / `MINIO_ENDPOINT` | container defaults | Override to point at external services |
 
 See [`.env.example`](.env.example) for the full annotated list.
@@ -228,6 +245,14 @@ results:
 | `t8` | 5-year Labour Court, target=8, 5 workers | 2 171 | 7:26 | 292 |
 | `par_t16` | 5-year Labour Court, target=16, 5 workers | 2 170 | 3:22 | 644 |
 | `ymb_3yr_4bodies_c12t7` | 3y × 4 bodies × 12 months, cap=12, target=7 | **9 025** | **15:01** | **601** |
+
+These are historical throughput snapshots, not shipped configurations.
+The `par_t16` and `ymb_3yr_4bodies_c12t7` postures produced our fastest
+records/min numbers but sustained runs at aggregate ~80+ concurrent
+drew server-side blocking from WRC, so we ship a much more
+conservative default (aggregate ~16, see the *Configuration* section
+above). Reproduce any of the bench rows by exporting the corresponding
+env vars listed in each `bench/results/<label>/summary.md`.
 
 Full commentary and conclusions: [`bench/README.md`](bench/README.md).
 

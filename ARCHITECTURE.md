@@ -1,159 +1,42 @@
 # Architecture
 
-Scrapy → MinIO landing → BS4 transform → MinIO processed; metadata in Mongo,
-orchestrated by Dagster. Run instructions and env-var reference:
-[README.md](README.md). Empirical benchmark numbers: [bench/](bench/).
+Scrapy → MinIO landing → BS4 transform → MinIO processed; metadata in Mongo, orchestrated by Dagster. Run instructions: [README.md](README.md). Bench numbers: [bench/](bench/).
 
 ## Partition size
 
-Default is **monthly** (`SCRAPER_PARTITION_SIZE=monthly`, matching the
-Dagster asset). Weekly and daily are also implemented in
-`scrapers/utils/dates.py:iter_partitions` and switchable via env var.
-Reasons monthly is the default:
-
-- Recon gave month-level volumes (Labour Court Jan 2026 = 40, full-year
-  2025 = 361, WRC full-year 2025 ≈ 2 571). A month is small enough to
-  reason about, big enough to amortise Scrapy subprocess startup cost.
-- Site's visible pagination window caps at 10 records/page; smaller
-  partitions minimise pagination-loop cursor drift.
-- Dagster's `MonthlyPartitionsDefinition` lines up 1-to-1 with the
-  `partition_date` column in Mongo, giving a stable per-month "was this
-  materialized?" checkbox.
-- Empirically validated at scale: `bench/results/ymb_3yr_4bodies_c12t7`
-  materialised 144 monthly partitions (3 years × 4 bodies × 12 months) in
-  15 min at 601 records/min, zero HTTP failures.
-
-Switch to daily when back-filling a very high-volume body to keep
-individual runs short and re-runnable; weekly is a middle ground.
+Default **monthly** (`SCRAPER_PARTITION_SIZE=monthly`, matching the Dagster `MonthlyPartitionsDefinition`); weekly and daily also implemented. Monthly amortises Scrapy subprocess startup cost across enough in-partition work that launch overhead stays a small fraction of wall-clock — daily lost proportionally more time to process launches in bench iterations. Site pagination caps at 10 records/page, so smaller partitions minimise cursor drift. Dagster's monthly partition key maps 1-to-1 to Mongo's `partition_date` column, giving a stable per-month "materialized?" checkbox. Bench harness validated the scheme at 144 monthly slices (3 y × 4 bodies × 12 months) end-to-end with zero HTTP failures at ingest (see `bench/results/ymb_3yr_4bodies_c12t7`); switch to daily for very high-volume back-fills, weekly as a middle ground.
 
 ## Retries & rate limiting
 
-- **AutoThrottle** (`SCRAPER_AUTOTHROTTLE_ENABLED=true`) is the primary
-  throughput lever. Start delay `0.25 s`, max `10 s`, target concurrency
-  `7`; delay adapts per-slot as `latency / target_concurrency`, so it
-  backs off automatically when WRC's response time climbs.
-- **Fixed ceilings**: `CONCURRENT_REQUESTS=16`,
-  `CONCURRENT_REQUESTS_PER_DOMAIN=16`. AutoThrottle grows into these but
-  never past them.
-- **Retries**: Scrapy's `RetryMiddleware` with `RETRY_TIMES=5`. Retriable
-  status codes and connection errors are the built-in defaults — WRC
-  runs on IIS/ASP.NET and does occasionally 5xx.
-- **Post-retry failures** are caught by an `errback` on every `Request`
-  and by the `item_error` signal — both emit a `record_failed` JSON
-  event with URL + status + error class, so a reviewer can reconcile
-  `total_found` vs `scraped + failed + row_parse_failed` from the JSON
-  log alone.
-- **robots.txt** is respected (`ROBOTSTXT_OBEY=true`); recon confirmed
-  our targets are not disallowed.
-- **Empirically validated**: `bench/results/par_t16` sustained aggregate
-  80 concurrent requests (5 processes × per-process target=16) with
-  **zero retries, zero `record_failed`, zero 5xx** across 2170 records —
-  well past the reference-implementation's claimed "a few concurrent"
-  ceiling.
-- **Ships fast, dials down easy**: shipped defaults (target=7,
-  `DAGSTER_MAX_CONCURRENT_RUNS=12`, aggregate ~84) match our fastest
-  validated config (`ymb_3yr_4bodies_c12t7`, 601 rec/min); the safer
-  reference-implementation config (aggregate ~16) is one env-var edit
-  away if the site tightens throttling.
+**Aggregate load kept near ~16 concurrent** — the posture our internal load testing found reliably sustainable on multi-hour crawls. Shipped defaults: `AUTOTHROTTLE_TARGET_CONCURRENCY=4` × `DAGSTER_MAX_CONCURRENT_RUNS=4`. Faster configurations (aggregate ~80+) were measurably quicker on isolated benches but drew server-side blocking on sustained runs, so we don't ship them. Hard ceiling `CONCURRENT_REQUESTS=CONCURRENT_REQUESTS_PER_DOMAIN=8` gives 2× headroom over target — bounds AutoThrottle bursts without letting effective concurrency climb back into the range that historically triggered blocking.
+
+**AutoThrottle** (`start_delay=0.25s`, `max_delay=10s`, `target=4`) adapts per-slot delay as `latency / target_concurrency`, so it backs off automatically when WRC latency climbs.
+
+**Retries.** `RetryMiddleware` with `RETRY_TIMES=5` and an extended `RETRY_HTTP_CODES = [403, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]` — the 403 + 520–524 additions cover WAF challenges and Cloudflare origin/edge errors that would otherwise land as terminal `record_failed` events. Post-retry failures are caught by an `errback` on every `Request` and by the `item_error` signal — both emit `record_failed` JSON events with URL + status + error class, so `total_found = scraped + failed + row_parse_failed` reconciles from the log stream alone. `ROBOTSTXT_OBEY=true`.
+
+**Anti-fingerprint hygiene** — three cheap layers that make requests look like a real browser session at the WAF layer:
+
+- `RotatingUserAgentMiddleware` (`scrapers/middlewares.py`) — random `User-Agent` per request from a 6-string pool (Windows/macOS/Linux × Chrome/Edge/Safari/Firefox); pool overridable via `SCRAPER_USER_AGENT_POOL` (pipe-separated).
+- `DEFAULT_REQUEST_HEADERS` — `Accept-Language: en-IE`, `Upgrade-Insecure-Requests`, the `Sec-Fetch-Dest/Mode/Site/User` quartet, `DNT: 1` — the shape a real browser sends on a top-level navigation.
+- Cloudflare-aware `RETRY_HTTP_CODES` (above).
 
 ## Deduplication
 
-Single `file_hash`, single Mongo unique index, canonicalized payload.
+Single `file_hash`, single Mongo unique index, canonicalised payload.
 
-- `file_hash` — SHA-256 of the **exact stored bytes**. Reproducible
-  against the MinIO object (`sha256 <object> == file_hash` in Mongo).
-- Stability across re-fetches comes from **canonicalizing the payload
-  before storing it**, not from a second hash. WRC injects volatile
-  server comments (`Elapsed time`, `cached or not being index.aspx page`)
-  that would otherwise flip `sha256(raw_bytes)` on every request;
-  `storage.hashing.canonicalize_html` strips them once, so everything
-  downstream (`put_object`, `sha256_hash`, Mongo compare) sees the same
-  bytes. PDF/DOC payloads are byte-stable already and pass through.
-- Mongo `identifier` is a **unique index**; every write is
-  `update_one({identifier: …}, upsert=True)`. Parallel workers on the
-  same partition physically cannot create a duplicate.
-- Landing Zone objects are **immutable**. Keys are
-  `{body_slug}/{YYYY-MM}/{identifier}-{file_hash[:12]}.{ext}` — a real
-  content change writes to a new key, satisfying the task requirement
-  that landing bytes are never mutated. `file_path` in Mongo always
-  points at the latest version.
-- **Transform warm-path fast bypass**: when
-  `landing.file_hash == processed.source_file_hash`, the cleaner is
-  deterministic so cleaned output would be byte-identical — we skip the
-  MinIO get + BS4 clean + rehash entirely. `TRANSFORM_VERSION` stamped
-  on every processed row guards this: bumping it forces a one-time
-  reprocess when the cleaner/extractor contract changes, then returns
-  to the near-zero-cost warm path. Measured: transform warm run of 339
-  records dropped from 7.08 s to 0.51 s (~14× faster) after this
-  landed — see `bench/results/after-fix/`.
-- **Pydantic validation gate**: every candidate row passes through
-  `transform.validation.ProcessedRecord` before the upsert. Failures
-  route to `quarantine_metadata` with the reason attached — a given
-  identifier is in exactly one of {processed, quarantine, neither}.
-- **Batched writes**: `bulk_write(ordered=False)` every
-  `TRANSFORM_BULK_BATCH_SIZE=200` records. Partial-success semantics
-  logged per failed op.
+- `file_hash` = SHA-256 of the exact stored bytes; `sha256(minio_object) == file_hash` in Mongo.
+- Stability from **canonicalising before storing**: WRC injects volatile server comments (`Elapsed time`, `cached or not being index.aspx`); `storage.hashing.canonicalize_html` strips them once so `put_object`, `sha256_hash`, and Mongo compare all see the same bytes. PDF/DOC pass through unchanged.
+- Mongo `identifier` is a unique index; every write is `update_one(upsert=True)`. Parallel workers physically cannot create duplicates.
+- Landing objects are immutable — keys `{body_slug}/{YYYY-MM}/{identifier}-{hash[:12]}.{ext}`; a real content change writes a new key.
+- **Transform warm-path fast bypass**: when `landing.file_hash == processed.source_file_hash` at the current `TRANSFORM_VERSION`, we skip MinIO get + BS4 clean + rehash entirely. Bumping `TRANSFORM_VERSION` forces a one-time reprocess when the cleaner contract changes. Measured 14× warm-run speedup.
+- **Pydantic validation gate** — `ProcessedRecord` validates every candidate before the upsert; failures route to `quarantine_metadata` with the reason attached, so a given identifier lives in exactly one of {processed, quarantine, neither}.
 
-## Data quality (beyond task spec)
+## Scaling to 50+ sources
 
-- **Plain-text sibling `{identifier}.txt`** — BS4 for HTML, `pypdf` for
-  PDF, written next to the archived HTML/PDF (which stays untouched).
-  Corpus becomes searchable/embeddable without re-parsing.
-- **Structured fields** — `transform.extractor` pulls chair, parties,
-  hearing_date, acts_cited, award_amount into
-  `processed_metadata.structured`. HTML blob → queryable dataset.
-- **Pydantic gate** — per-body identifier regex + `date ≤ partition_end`
-  + size floor; failures route to `quarantine_metadata` (also referenced
-  under Deduplication).
+Bodies are already configuration (`SCRAPER_BODIES`); sources need the same treatment plus platform-scale investments:
 
-## What would change for 50+ sources
-
-The current design already treats bodies as configuration
-(`SCRAPER_BODIES` in `.env`). Scaling to sources needs the same
-treatment plus orchestration-scale investments a working data platform
-would demand:
-
-1. **Sources as configuration, not code.** Move per-site knowledge —
-   list-page selectors, detail-page selectors, pagination scheme,
-   date-filter parameter names, robots hint, rate-limit floor — into a
-   YAML/JSON registry. One `GenericLegalSpider` reads it; per-source
-   overrides land as extension modules for pages that don't fit the
-   template.
-2. **Source-first storage + tiering + a gold layer.** Object keys
-   become `{source}/{body_slug}/{YYYY-MM}/{identifier}-{hash}.{ext}`;
-   Mongo gains a `source` field with a compound index `(source,
-   partition_date)`. Hot→warm→cold object-storage tiering by partition
-   age. Add a **gold layer** of analytical aggregates
-   (per-source freshness, volumes, quarantine ratios) so ops can see
-   "which source hasn't shipped in 3 days" without querying raw
-   metadata.
-3. **Orchestration scale-out.** Dagster partition axis becomes
-   `(source × month)`; `QueuedRunCoordinator` moves off SQLite to
-   Postgres; a Kubernetes run launcher or Celery pool fans partitions
-   across workers. **Per-source concurrency caps** in the registry —
-   a small government site tolerates ~40 concurrent while a commercial
-   API tolerates ~200; one global knob doesn't fit.
-4. **Observability + SLOs.** Prometheus metrics on `found`,
-   `scraped`, `failed`, `quarantine_ratio` labelled by `source`.
-   Grafana dashboard tracking freshness
-   (`max(partition_date)` per source) and volume-delta anomalies >2σ
-   from the trailing-30-day mean. Schema drift on a source typically
-   surfaces as a silent volume drop *before* the error rate climbs, so
-   volume anomaly detection is the leading indicator.
-5. **Data-quality contracts per source.** The pydantic gate we ship is
-   source-agnostic today; extend it to source-specific rules (this
-   source's `date` is always ISO, that source's identifiers match a
-   known regex). Quarantine already exists; add a `source` label so
-   per-source recovery is a filtered query. Great Expectations for
-   gold-layer aggregates.
-6. **Perf headroom for 1000× scale.** Streaming downloads via a custom
-   Twisted download handler for >1 MB payloads (bypass
-   `response.body` full-buffering); batched scraper-pipeline writes via
-   a Twisted queue once single-source throughput exceeds ~50 rec/s
-   (transform already batches at 200-op flushes).
-7. **Source-config CI/CD.** PR review each new source config
-   (selector correctness, robots compliance, rate-limit floor); canary
-   crawl on a small date range before merging; blue/green partition
-   sets so a mid-flight selector fix doesn't retroactively invalidate
-   the historical corpus.
-
+1. **Sources as a YAML/JSON registry.** Per-site list/detail selectors, pagination scheme, date-param names, rate-limit floor. One `GenericLegalSpider` reads the registry; extension modules for oddballs.
+2. **Source-first storage + gold layer.** Keys `{source}/{body}/{YYYY-MM}/...`; Mongo `source` field with compound index `(source, partition_date)`; hot/warm/cold tiering by partition age. Add analytical aggregates (per-source freshness, quarantine ratio) so ops can see "which source hasn't shipped in 3 days" without touching raw metadata.
+3. **Orchestration scale-out.** Partition axis becomes `(source × month)`; `QueuedRunCoordinator` moves to Postgres; a Kubernetes run launcher fans partitions across workers. Per-source concurrency caps in the registry — a small government site tolerates ~40 concurrent while a commercial API tolerates ~200; one global knob doesn't fit.
+4. **Observability + SLOs.** Prometheus metrics labelled by source (`found`, `scraped`, `failed`, `quarantine_ratio`); Grafana dashboards tracking freshness and volume-delta anomalies >2σ from the trailing-30-day mean — schema drift on a source typically surfaces as a silent volume drop *before* the error rate climbs.
+5. **Perf headroom for 1000× scale.** Streaming download handler for >1 MB payloads (bypass `response.body` full-buffering); batched scraper-pipeline writes via a Twisted queue once single-source throughput exceeds ~50 rec/s.
