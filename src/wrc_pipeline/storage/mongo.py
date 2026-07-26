@@ -22,8 +22,21 @@ from pymongo.collection import Collection
 from wrc_pipeline.config.settings import settings
 
 
+# Hardcoded rather than env-driven: these are safety nets against a wedged
+# server, not operational tuning knobs. Without them the driver's defaults
+# turn "server unreachable" into a 30 s silent stall per operation.
+_SERVER_SELECTION_TIMEOUT_MS = 5000
+_CONNECT_TIMEOUT_MS = 5000
+_SOCKET_TIMEOUT_MS = 30000
+
+
 def get_mongo_client(uri: str | None = None) -> MongoClient:
-    return MongoClient(uri or settings.mongo.uri)
+    return MongoClient(
+        uri or settings.mongo.uri,
+        serverSelectionTimeoutMS=_SERVER_SELECTION_TIMEOUT_MS,
+        connectTimeoutMS=_CONNECT_TIMEOUT_MS,
+        socketTimeoutMS=_SOCKET_TIMEOUT_MS,
+    )
 
 
 def get_collection(name: str, client: MongoClient | None = None) -> Collection:
@@ -31,16 +44,10 @@ def get_collection(name: str, client: MongoClient | None = None) -> Collection:
     return client[settings.mongo.db][name]
 
 
-def ensure_landing_indexes(collection: Collection) -> None:
-    collection.create_index([("identifier", ASCENDING)], unique=True, name="identifier_unique")
-    collection.create_index([("partition_date", ASCENDING)], name="partition_date_idx")
-    collection.create_index([("file_hash", ASCENDING)], name="file_hash_idx")
-    collection.create_index([("body", ASCENDING)], name="body_idx")
-
-
-def ensure_processed_indexes(collection: Collection) -> None:
-    # Same shape as landing — the processed collection has the same query
-    # patterns (identifier lookups, date-range scans, hash audits).
+def ensure_indexes(collection: Collection) -> None:
+    # Same index set for landing and processed — both are queried by
+    # identifier (idempotency), partition_date (range scans), file_hash
+    # (dedup audits), and body (per-tribunal reports).
     collection.create_index([("identifier", ASCENDING)], unique=True, name="identifier_unique")
     collection.create_index([("partition_date", ASCENDING)], name="partition_date_idx")
     collection.create_index([("file_hash", ASCENDING)], name="file_hash_idx")

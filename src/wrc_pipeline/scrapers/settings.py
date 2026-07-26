@@ -25,8 +25,8 @@ CONCURRENT_REQUESTS = _cfg.scraper.concurrent_requests
 CONCURRENT_REQUESTS_PER_DOMAIN = _cfg.scraper.concurrent_requests_per_domain
 DOWNLOAD_DELAY = _cfg.scraper.download_delay
 AUTOTHROTTLE_ENABLED = _cfg.scraper.autothrottle_enabled
-AUTOTHROTTLE_START_DELAY = 1.0
-AUTOTHROTTLE_MAX_DELAY = 10.0
+AUTOTHROTTLE_START_DELAY = _cfg.scraper.autothrottle_start_delay
+AUTOTHROTTLE_MAX_DELAY = _cfg.scraper.autothrottle_max_delay
 AUTOTHROTTLE_TARGET_CONCURRENCY = _cfg.scraper.autothrottle_target_concurrency
 
 # Retry idempotent failures a few times; site is IIS/ASP.NET, occasional 5xx expected.

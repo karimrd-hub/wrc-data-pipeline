@@ -38,12 +38,14 @@ services:
       retries: 5
       start_period: 20s
 
-  # Dagit + scraper + transform, all in one image. UI at http://localhost:3000.
-  # Container names of ``mongo`` / ``minio`` are the internal service DNS names,
-  # so the app talks to them directly instead of through host port forwards.
-  app:
+  # Dagster webserver (Dagit UI). Split from the daemon so the
+  # QueuedRunCoordinator (see ``dagster.yaml``) can dispatch multiple partition
+  # runs concurrently instead of running them serially inside ``dagster dev``.
+  # Both services share the ``dagster_home`` volume so run state, event log,
+  # and the queue table are visible to both.
+  dagster-webserver: &dagster_service
     build: .
-    container_name: wrc-app
+    container_name: wrc-dagster-webserver
     depends_on:
       mongo:
         condition: service_healthy
@@ -53,7 +55,9 @@ services:
         condition: service_completed_successfully
     ports:
       - "${DAGSTER_PORT:-3000}:3000"
-    environment:
+    environment: &dagster_env
+      DAGSTER_HOME: /opt/dagster_home
+      DAGSTER_MAX_CONCURRENT_RUNS: ${DAGSTER_MAX_CONCURRENT_RUNS:-4}
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: ${MONGO_DB:-wrc}
       MONGO_LANDING_COLLECTION: ${MONGO_LANDING_COLLECTION:-landing_metadata}
@@ -65,8 +69,40 @@ services:
       MINIO_LANDING_BUCKET: ${MINIO_LANDING_BUCKET:-landing-zone}
       MINIO_PROCESSED_BUCKET: ${MINIO_PROCESSED_BUCKET:-processed}
       SCRAPER_PARTITION_SIZE: ${SCRAPER_PARTITION_SIZE:-monthly}
+      SCRAPER_AUTOTHROTTLE_START_DELAY: ${SCRAPER_AUTOTHROTTLE_START_DELAY:-0.25}
+      SCRAPER_AUTOTHROTTLE_MAX_DELAY: ${SCRAPER_AUTOTHROTTLE_MAX_DELAY:-10.0}
+      # Left unset here defers to config/settings.py's built-in default; the
+      # colon-and-comma format would tangle with compose's `${VAR:-default}`
+      # interpolation, so we only pass a value if the reviewer set one.
+      SCRAPER_BODIES: ${SCRAPER_BODIES-}
       SCRAPER_LOG_LEVEL: ${SCRAPER_LOG_LEVEL:-INFO}
+      DAGSTER_PARTITION_START_DATE: ${DAGSTER_PARTITION_START_DATE:-2020-01-01}
+    volumes:
+      - dagster_home:/opt/dagster_home
+      - ./dagster.yaml:/opt/dagster_home/dagster.yaml:ro
     restart: unless-stopped
+    command:
+      - dagster-webserver
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3000"
+      - -m
+      - wrc_pipeline.orchestration
+
+  # Dagster daemon: dequeues runs from the QueuedRunCoordinator and launches
+  # them. Without this service, queued runs would sit in the queue forever.
+  # Shares the image, env, and DAGSTER_HOME with the webserver via YAML anchors.
+  dagster-daemon:
+    <<: *dagster_service
+    container_name: wrc-dagster-daemon
+    environment: *dagster_env
+    ports: []
+    command:
+      - dagster-daemon
+      - run
+      - -m
+      - wrc_pipeline.orchestration
 
   # One-shot: waits for MinIO to be healthy, then creates the landing + processed
   # buckets idempotently. Exits 0 when done. Not restarted.
@@ -94,3 +130,4 @@ services:
 volumes:
   mongo_data:
   minio_data:
+  dagster_home:

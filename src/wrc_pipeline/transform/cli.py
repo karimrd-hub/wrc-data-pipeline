@@ -9,10 +9,9 @@ Usage:
 
 All connection strings, buckets, and collection names come from the shared
 ``config.settings`` module — this script has no configuration of its own.
-Exit code is 0 on completion (even with per-record failures, which are
-logged as ``record_failed`` JSON events and counted in ``transform_summary``)
-and non-zero only on argument-parsing errors or unrecoverable startup
-failures.
+Exit code is 0 when every record was processed cleanly, 2 when the run
+completed but had per-record failures (still logged as ``record_failed``
+JSON events), and non-zero on argument-parsing / startup errors.
 """
 
 from __future__ import annotations
@@ -63,8 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     body_ids = _parse_bodies(args.bodies)
     runner = TransformRunner()
-    runner.run(args.start_date, args.end_date, body_ids=body_ids)
-    return 0
+    stats = runner.run(args.start_date, args.end_date, body_ids=body_ids)
+    # 2 chosen (not 1) so caller can distinguish "per-record failures" from
+    # generic "something crashed at startup" via the standard argparse code.
+    return 2 if stats.failed > 0 else 0
 
 
 if __name__ == "__main__":

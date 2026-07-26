@@ -34,10 +34,13 @@ output bytes are identical — the caller relies on this for idempotency.
 from __future__ import annotations
 
 from bs4 import BeautifulSoup, Comment, Tag
+from bs4.builder import ParserRejectedMarkup
 
 
 class ContentNotFoundError(Exception):
-    """Raised when neither ``col-sm-9`` nor ``div.content`` is present."""
+    """Raised when the payload can't yield a usable content subtree —
+    either lxml rejected it as malformed markup, or it parsed cleanly but
+    neither ``col-sm-9`` nor ``div.content`` was present."""
 
 
 # Tags we drop wholesale from within the extracted subtree. All are chrome
@@ -67,7 +70,12 @@ def clean_html(payload: bytes, identifier: str) -> bytes:
     identifier
         Canonical record identifier — used as the document ``<title>``.
     """
-    soup = BeautifulSoup(payload, "lxml")
+    try:
+        soup = BeautifulSoup(payload, "lxml")
+    except ParserRejectedMarkup as exc:
+        raise ContentNotFoundError(
+            f"lxml rejected {len(payload)} bytes as malformed markup"
+        ) from exc
 
     extracted = _extract_relevant(soup)
     if extracted is None:

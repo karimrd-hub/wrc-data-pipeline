@@ -1,0 +1,16 @@
+# Dagster instance config. Copied into $DAGSTER_HOME at container start.
+#
+# QueuedRunCoordinator + the separate ``dagster-daemon`` service let multiple
+# (month × body) partitions materialize in parallel — the leverage point for
+# the multi-partition asset defined in ``orchestration/definitions.py``.
+#
+# Reference-server safety: AutoThrottle is per-process and does not see
+# cross-process load, so N concurrent runs = N × per-process concurrency
+# aggregate on the WRC domain. Start at 2, measure, push higher only if the
+# site tolerates it (recon §7.10 validated per-process, not aggregate).
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs:
+      env: DAGSTER_MAX_CONCURRENT_RUNS

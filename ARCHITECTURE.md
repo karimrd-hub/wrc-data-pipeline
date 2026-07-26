@@ -43,27 +43,33 @@ keep individual runs short and re-runnable; weekly is a middle ground.
 
 ## Deduplication
 
-Two-hash design, single Mongo unique index:
+Single `file_hash`, single Mongo unique index.
 
 - `file_hash` — SHA-256 of the **exact stored bytes**. Reproducible
-  against the MinIO object.
-- `content_hash` — SHA-256 of the payload after stripping known volatile
-  server markers (`Elapsed time`, `cached or not being index.aspx page`).
+  against the MinIO object (`sha256 <object> == file_hash` in Mongo).
   Drives the skip/upload branch, so re-scraping a decision the site
   hasn't changed is a Mongo `$set` on `last_seen_at` and zero MinIO
   puts.
+
+Stability across re-fetches comes from **canonicalizing the payload
+before storing it**, not from a second hash. WRC injects volatile
+server comments (`Elapsed time`, `cached or not being index.aspx page`)
+that would otherwise flip `sha256(raw_bytes)` on every request;
+`storage.hashing.canonicalize_html` strips them once, and everything
+downstream (`put_object`, `sha256_hash`, Mongo compare) sees the same
+bytes. PDF/DOC payloads are byte-stable already and pass through
+untouched.
 
 Mongo `landing_metadata.identifier` is a **unique index** — every write
 is `update_one({identifier: …}, upsert=True)`. Even a parallel worker
 racing on the same partition physically cannot create a duplicate.
 
 Landing Zone objects are **immutable**. Keys are
-`{body_slug}/{YYYY-MM}/{identifier}-{content_hash[:12]}.{ext}`, so a
-real content change writes to a new key rather than overwriting the
-previous bytes — required by the task tip
-("don't delete/update stored data in the Landing Zone"). `file_path` in
-Mongo always points at the latest version; older bytes remain
-recoverable by prefix scan.
+`{body_slug}/{YYYY-MM}/{identifier}-{file_hash[:12]}.{ext}`, so a real
+content change writes to a new key rather than overwriting the previous
+bytes — required by the task tip ("don't delete/update stored data in
+the Landing Zone"). `file_path` in Mongo always points at the latest
+version; older bytes remain recoverable by prefix scan.
 
 The transform step does the same trick for its collection: compare the
 freshly-computed hash of the cleaned output against

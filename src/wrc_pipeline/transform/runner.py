@@ -35,18 +35,16 @@ from datetime import date, datetime, timezone
 from typing import Iterable
 
 from minio import Minio
+from minio.error import S3Error
 from pymongo.collection import Collection
+from pymongo.errors import PyMongoError
 
 from wrc_pipeline.config.settings import settings
 from wrc_pipeline.logging_setup import get_json_logger
 from wrc_pipeline.scrapers.utils.bodies import BODIES, body_slug
 from wrc_pipeline.storage.hashing import sha256_hash
 from wrc_pipeline.storage.minio import ensure_bucket, get_minio_client
-from wrc_pipeline.storage.mongo import (
-    ensure_processed_indexes,
-    get_collection,
-    get_mongo_client,
-)
+from wrc_pipeline.storage.mongo import ensure_indexes, get_collection, get_mongo_client
 from wrc_pipeline.transform.cleaner import ContentNotFoundError, clean_html
 
 
@@ -78,6 +76,14 @@ class TransformStats:
 
 def _new_partition_counter() -> dict[str, int]:
     return {"transformed": 0, "unchanged": 0, "passthrough": 0, "failed": 0}
+
+
+def _mongo_error_extra(exc: PyMongoError) -> dict:
+    return {
+        "collection": settings.mongo.processed_collection,
+        "error": type(exc).__name__,
+        "message": str(exc)[:200],
+    }
 
 
 def _validate_bodies(body_ids: Iterable[int] | None) -> list[str] | None:
@@ -116,7 +122,7 @@ class TransformRunner:
         self.processed = processed_collection or get_collection(
             settings.mongo.processed_collection, self.mongo_client
         )
-        ensure_processed_indexes(self.processed)
+        ensure_indexes(self.processed)
         self.minio = minio or get_minio_client()
         ensure_bucket(self.minio, settings.minio.processed_bucket)
         self.stats = TransformStats()
@@ -191,13 +197,23 @@ class TransformRunner:
 
         try:
             raw = self._download(landing_path)
-        except Exception as exc:  # network / missing object / permissions
+        except S3Error as exc:
+            # S3-level error: object gone, forbidden, bucket missing. Per-record
+            # recoverable — log and skip. The bucket-level cases (NoSuchBucket,
+            # AccessDenied) will repeat for every record, which surfaces the
+            # infra issue via a burst of identical failures in the summary.
             self._record_failed(
                 identifier,
                 body,
                 partition_date,
                 reason="landing_download_failed",
-                extra={"landing_path": landing_path, "error": type(exc).__name__, "message": str(exc)[:200]},
+                extra={
+                    "landing_path": landing_path,
+                    "bucket": settings.minio.landing_bucket,
+                    "error": type(exc).__name__,
+                    "s3_code": exc.code,
+                    "message": str(exc)[:200],
+                },
             )
             return
 
@@ -210,7 +226,11 @@ class TransformRunner:
                     body,
                     partition_date,
                     reason="content_not_found",
-                    extra={"landing_path": landing_path, "message": str(exc)},
+                    extra={
+                        "landing_path": landing_path,
+                        "raw_size": len(raw),
+                        "message": str(exc)[:200],
+                    },
                 )
                 return
             outcome_kind = "transformed"
@@ -224,17 +244,34 @@ class TransformRunner:
         new_hash = sha256_hash(payload)
         processed_path = f"{body_slug(body)}/{identifier}.{ext}"
 
-        existing = self.processed.find_one(
-            {"identifier": identifier},
-            {"file_hash": 1},
-        )
+        try:
+            existing = self.processed.find_one(
+                {"identifier": identifier},
+                {"file_hash": 1},
+            )
+        except PyMongoError as exc:
+            self._record_failed(
+                identifier, body, partition_date,
+                reason="processed_mongo_failed",
+                extra=_mongo_error_extra(exc),
+            )
+            return
+
         now = datetime.now(timezone.utc)
 
         if existing is not None and existing.get("file_hash") == new_hash:
-            self.processed.update_one(
-                {"identifier": identifier},
-                {"$set": {"last_transformed_at": now}},
-            )
+            try:
+                self.processed.update_one(
+                    {"identifier": identifier},
+                    {"$set": {"last_transformed_at": now}},
+                )
+            except PyMongoError as exc:
+                self._record_failed(
+                    identifier, body, partition_date,
+                    reason="processed_mongo_failed",
+                    extra=_mongo_error_extra(exc),
+                )
+                return
             self.stats.bump(body, partition_date, "unchanged")
             self.log.info(
                 "record_unchanged",
@@ -248,7 +285,24 @@ class TransformRunner:
             )
             return
 
-        self._upload(processed_path, payload, ext)
+        try:
+            self._upload(processed_path, payload, ext)
+        except S3Error as exc:
+            self._record_failed(
+                identifier,
+                body,
+                partition_date,
+                reason="processed_upload_failed",
+                extra={
+                    "processed_path": processed_path,
+                    "bucket": settings.minio.processed_bucket,
+                    "payload_size": len(payload),
+                    "error": type(exc).__name__,
+                    "s3_code": exc.code,
+                    "message": str(exc)[:200],
+                },
+            )
+            return
 
         metadata = {
             "identifier": identifier,
@@ -272,11 +326,26 @@ class TransformRunner:
             "last_transformed_at": now,
             "updated_at": now,
         }
-        self.processed.update_one(
-            {"identifier": identifier},
-            {"$set": metadata, "$setOnInsert": {"first_transformed_at": now}},
-            upsert=True,
-        )
+        try:
+            self.processed.update_one(
+                {"identifier": identifier},
+                {"$set": metadata, "$setOnInsert": {"first_transformed_at": now}},
+                upsert=True,
+            )
+        except PyMongoError as exc:
+            # Upload already succeeded — the object exists in MinIO but the
+            # metadata upsert failed, so the record is effectively orphaned
+            # until the next successful transform run replays it. Flag the
+            # orphan path so an operator can reconcile manually.
+            self._record_failed(
+                identifier, body, partition_date,
+                reason="processed_mongo_failed",
+                extra={
+                    **_mongo_error_extra(exc),
+                    "orphan_processed_path": processed_path,
+                },
+            )
+            return
         self.stats.bump(body, partition_date, outcome_kind)
         self.log.info(
             "record_transformed",
