@@ -43,10 +43,9 @@ from wrc_pipeline.scrapers.utils.bodies import BODIES, body_slug
 from wrc_pipeline.transform.runner import TransformRunner
 
 
-# Hardcoded rather than env-driven: this is a safety net against a wedged
-# spider (DNS stall, hung TCP), not an operational knob. One hour is well
-# beyond any observed partition runtime; adjust if a real workload trips it.
-_SUBPROCESS_TIMEOUT_SEC = 3600
+# Subprocess wall-clock timeout lives in .env
+# (``DAGSTER_SUBPROCESS_TIMEOUT_SEC``); default one hour is well beyond any
+# observed partition runtime.
 
 
 # Slug -> numeric body id. Slugs are the human-readable dropdown values in
@@ -79,7 +78,10 @@ def _resolve(context) -> tuple[date, date, str, int]:
 
 @dg.asset(
     partitions_def=_PARTITIONS,
-    retry_policy=dg.RetryPolicy(max_retries=2, delay=30),
+    retry_policy=dg.RetryPolicy(
+        max_retries=settings.dagster.landing_max_retries,
+        delay=settings.dagster.landing_retry_delay_sec,
+    ),
     group_name="wrc",
     description="Raw WRC decisions for one (month × body) partition.",
 )
@@ -121,8 +123,9 @@ def landing_records(context) -> dg.MaterializeResult:
     )
     reader.start()
 
+    subprocess_timeout = settings.dagster.subprocess_timeout_sec
     try:
-        returncode = proc.wait(timeout=_SUBPROCESS_TIMEOUT_SEC)
+        returncode = proc.wait(timeout=subprocess_timeout)
     except subprocess.TimeoutExpired:
         proc.terminate()
         try:
@@ -133,7 +136,7 @@ def landing_records(context) -> dg.MaterializeResult:
         reader.join(timeout=5)
         raise dg.Failure(
             description=(
-                f"scrapy timed out after {_SUBPROCESS_TIMEOUT_SEC}s for "
+                f"scrapy timed out after {subprocess_timeout}s for "
                 f"partition {context.partition_key}"
             ),
         )
@@ -161,7 +164,10 @@ def landing_records(context) -> dg.MaterializeResult:
 @dg.asset(
     partitions_def=_PARTITIONS,
     deps=[landing_records],
-    retry_policy=dg.RetryPolicy(max_retries=2, delay=15),
+    retry_policy=dg.RetryPolicy(
+        max_retries=settings.dagster.processed_max_retries,
+        delay=settings.dagster.processed_retry_delay_sec,
+    ),
     group_name="wrc",
     description="Cleaned + renamed WRC decisions for one (month × body) partition.",
 )

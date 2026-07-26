@@ -14,16 +14,12 @@ from minio import Minio
 from wrc_pipeline.config.settings import settings
 
 
-# Hardcoded rather than env-driven: safety nets against a half-open connection,
-# not operational tuning knobs. Defaults are generous enough for large PDFs
-# on slow uplinks; tighten if you actually observe hangs.
-_CONNECT_TIMEOUT_SEC = 5.0
-_READ_TIMEOUT_SEC = 30.0
-
-
 def get_minio_client() -> Minio:
     http_client = urllib3.PoolManager(
-        timeout=urllib3.Timeout(connect=_CONNECT_TIMEOUT_SEC, read=_READ_TIMEOUT_SEC),
+        timeout=urllib3.Timeout(
+            connect=settings.minio.connect_timeout_sec,
+            read=settings.minio.read_timeout_sec,
+        ),
     )
     return Minio(
         settings.minio.endpoint,

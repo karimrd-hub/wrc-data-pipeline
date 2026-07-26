@@ -82,6 +82,9 @@ class MongoSettings:
     db: str
     landing_collection: str
     processed_collection: str
+    server_selection_timeout_ms: int
+    connect_timeout_ms: int
+    socket_timeout_ms: int
 
     @classmethod
     def from_env(cls) -> "MongoSettings":
@@ -90,6 +93,9 @@ class MongoSettings:
             db=_str("MONGO_DB", "wrc"),
             landing_collection=_str("MONGO_LANDING_COLLECTION", "landing_metadata"),
             processed_collection=_str("MONGO_PROCESSED_COLLECTION", "processed_metadata"),
+            server_selection_timeout_ms=_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 5000),
+            connect_timeout_ms=_int("MONGO_CONNECT_TIMEOUT_MS", 5000),
+            socket_timeout_ms=_int("MONGO_SOCKET_TIMEOUT_MS", 30000),
         )
 
 
@@ -101,6 +107,8 @@ class MinioSettings:
     secure: bool
     landing_bucket: str
     processed_bucket: str
+    connect_timeout_sec: float
+    read_timeout_sec: float
 
     @classmethod
     def from_env(cls) -> "MinioSettings":
@@ -111,6 +119,8 @@ class MinioSettings:
             secure=_bool("MINIO_SECURE", False),
             landing_bucket=_str("MINIO_LANDING_BUCKET", "landing-zone"),
             processed_bucket=_str("MINIO_PROCESSED_BUCKET", "processed"),
+            connect_timeout_sec=_float("MINIO_CONNECT_TIMEOUT_SEC", 5.0),
+            read_timeout_sec=_float("MINIO_READ_TIMEOUT_SEC", 30.0),
         )
 
 
@@ -152,11 +162,32 @@ class ScraperSettings:
 
 
 @dataclass(frozen=True)
+class TransformSettings:
+    bulk_batch_size: int
+
+    @classmethod
+    def from_env(cls) -> "TransformSettings":
+        return cls(
+            bulk_batch_size=_int("TRANSFORM_BULK_BATCH_SIZE", 200),
+        )
+
+
+@dataclass(frozen=True)
 class DagsterSettings:
     # ISO YYYY-MM-DD — earliest partition offered in Dagit. Runs before this
     # date are not backfillable without a code change; pick the earliest date
     # you care about (the site itself has decisions back to ~2005).
     partition_start_date: str
+    # Wall-clock ceiling for the Scrapy subprocess spawned by landing_records.
+    # Safety net against a wedged spider (DNS stall, hung TCP), not an
+    # operational knob — one hour is well beyond any observed partition runtime.
+    subprocess_timeout_sec: int
+    # Per-asset retry policy: how many times Dagster re-runs the asset after
+    # the first failure, and how long it waits between attempts.
+    landing_max_retries: int
+    landing_retry_delay_sec: int
+    processed_max_retries: int
+    processed_retry_delay_sec: int
 
     @classmethod
     def from_env(cls) -> "DagsterSettings":
@@ -170,7 +201,14 @@ class DagsterSettings:
             raise ValueError(
                 f"DAGSTER_PARTITION_START_DATE must be YYYY-MM-DD, got {value!r}"
             ) from exc
-        return cls(partition_start_date=value)
+        return cls(
+            partition_start_date=value,
+            subprocess_timeout_sec=_int("DAGSTER_SUBPROCESS_TIMEOUT_SEC", 3600),
+            landing_max_retries=_int("DAGSTER_LANDING_MAX_RETRIES", 2),
+            landing_retry_delay_sec=_int("DAGSTER_LANDING_RETRY_DELAY_SEC", 30),
+            processed_max_retries=_int("DAGSTER_PROCESSED_MAX_RETRIES", 2),
+            processed_retry_delay_sec=_int("DAGSTER_PROCESSED_RETRY_DELAY_SEC", 15),
+        )
 
 
 @dataclass(frozen=True)
@@ -178,6 +216,7 @@ class Settings:
     mongo: MongoSettings
     minio: MinioSettings
     scraper: ScraperSettings
+    transform: TransformSettings
     dagster: DagsterSettings
 
     @classmethod
@@ -186,6 +225,7 @@ class Settings:
             mongo=MongoSettings.from_env(),
             minio=MinioSettings.from_env(),
             scraper=ScraperSettings.from_env(),
+            transform=TransformSettings.from_env(),
             dagster=DagsterSettings.from_env(),
         )
 

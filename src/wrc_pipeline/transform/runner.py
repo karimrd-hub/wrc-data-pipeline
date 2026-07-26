@@ -59,9 +59,8 @@ EXT_MIME = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
-# Flush pending UpdateOne ops when this many are queued. 200 keeps peak
-# memory bounded while still amortizing round-trip cost across many records.
-_BULK_BATCH_SIZE = 200
+# Batch size lives in .env (``TRANSFORM_BULK_BATCH_SIZE``); default 200 keeps
+# peak memory bounded while still amortizing round-trip cost across many records.
 
 
 @dataclass
@@ -162,10 +161,11 @@ class TransformRunner:
             },
         )
 
+        batch_size = settings.transform.bulk_batch_size
         try:
             for record in cursor:
                 self._process_one(record)
-                if len(self._pending_ops) >= _BULK_BATCH_SIZE:
+                if len(self._pending_ops) >= batch_size:
                     self._flush_pending()
             self._flush_pending()
         finally:

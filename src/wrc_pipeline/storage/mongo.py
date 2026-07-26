@@ -22,20 +22,12 @@ from pymongo.collection import Collection
 from wrc_pipeline.config.settings import settings
 
 
-# Hardcoded rather than env-driven: these are safety nets against a wedged
-# server, not operational tuning knobs. Without them the driver's defaults
-# turn "server unreachable" into a 30 s silent stall per operation.
-_SERVER_SELECTION_TIMEOUT_MS = 5000
-_CONNECT_TIMEOUT_MS = 5000
-_SOCKET_TIMEOUT_MS = 30000
-
-
 def get_mongo_client(uri: str | None = None) -> MongoClient:
     return MongoClient(
         uri or settings.mongo.uri,
-        serverSelectionTimeoutMS=_SERVER_SELECTION_TIMEOUT_MS,
-        connectTimeoutMS=_CONNECT_TIMEOUT_MS,
-        socketTimeoutMS=_SOCKET_TIMEOUT_MS,
+        serverSelectionTimeoutMS=settings.mongo.server_selection_timeout_ms,
+        connectTimeoutMS=settings.mongo.connect_timeout_ms,
+        socketTimeoutMS=settings.mongo.socket_timeout_ms,
     )
 
 
