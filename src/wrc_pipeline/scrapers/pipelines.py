@@ -150,8 +150,16 @@ class StoragePipeline:
     def _prefetch_hashes(self, spider) -> dict[str, str | None]:
         start = spider.range_start.isoformat()
         end = spider.range_end.isoformat()
+        query: dict = {"partition_date": {"$gte": start, "$lte": end}}
+        # Scope by body when the spider was launched for a subset. In the
+        # Dagster per-body-subprocess mode every run is a single body, so
+        # this trims the prefetch by up to Nbodies× — significant once the
+        # landing collection has been backfilled across multiple bodies.
+        body_ids = getattr(spider, "body_ids", None)
+        if body_ids:
+            query["body_id"] = {"$in": list(body_ids)}
         cursor = self.collection.find(
-            {"partition_date": {"$gte": start, "$lte": end}},
+            query,
             {"identifier": 1, "file_hash": 1, "_id": 0},
         )
         return {doc["identifier"]: doc.get("file_hash") for doc in cursor}

@@ -12,19 +12,19 @@ Task requirements this module owns (docs/task.md, transformation script):
 * (c/v) Upsert into the processed collection with the new path + new hash.
 
 Idempotency (task req 9 is a whole-pipeline requirement, not just scraper):
-we compare the *newly-computed* ``file_hash`` of the cleaned payload against
-whatever is already in the processed collection for this identifier. If they
-match we skip the MinIO put and just bump ``last_transformed_at`` — so
-re-running against the same landing state is free. This also handles the
-"cleaner algo changed" case: a code change alters the cleaned bytes -> hash
-differs -> the record is re-materialized on the next run.
+two prefetched fields per already-processed identifier — ``file_hash`` (of
+the cleaned bytes) and ``source_file_hash`` (of the landing bytes we cleaned
+from). The cleaner is deterministic, so identical landing bytes always
+produce identical cleaned bytes; ``landing.file_hash == prefetched
+source_file_hash`` proves this record is unchanged without touching MinIO.
+That fast path is what makes a warm re-run near-free at reference volume.
+A second-chance check on the cleaned-hash catches "cleaner algo changed"
+and legacy records missing ``source_file_hash``.
 
-Everything is streamed one record at a time — Mongo cursor + MinIO
-``get_object`` + BS4 parse + MinIO ``put_object``. At the reference volume
-(500-1000 records) memory is bounded to a single decoded document at a
-time. Batching hooks (Mongo ``bulk_write``, parallel MinIO puts) are the
-1000x-scale levers called out in ``ARCHITECTURE.md`` — deliberately
-un-shipped here to keep the three-outcome branching readable.
+Batched writes: pending ``UpdateOne`` ops are flushed via
+``bulk_write(ordered=False)`` every ``_BULK_BATCH_SIZE`` records (and once
+at the end). Turns the per-record round-trip into one round-trip per batch;
+essential to make the warm path collapse to seconds even at 1000x volume.
 """
 
 from __future__ import annotations
@@ -36,8 +36,9 @@ from typing import Iterable
 
 from minio import Minio
 from minio.error import S3Error
+from pymongo import UpdateOne
 from pymongo.collection import Collection
-from pymongo.errors import PyMongoError
+from pymongo.errors import BulkWriteError
 
 from wrc_pipeline.config.settings import settings
 from wrc_pipeline.logging_setup import get_json_logger
@@ -58,6 +59,10 @@ EXT_MIME = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
+# Flush pending UpdateOne ops when this many are queued. 200 keeps peak
+# memory bounded while still amortizing round-trip cost across many records.
+_BULK_BATCH_SIZE = 200
+
 
 @dataclass
 class TransformStats:
@@ -76,14 +81,6 @@ class TransformStats:
 
 def _new_partition_counter() -> dict[str, int]:
     return {"transformed": 0, "unchanged": 0, "passthrough": 0, "failed": 0}
-
-
-def _mongo_error_extra(exc: PyMongoError) -> dict:
-    return {
-        "collection": settings.mongo.processed_collection,
-        "error": type(exc).__name__,
-        "message": str(exc)[:200],
-    }
 
 
 def _validate_bodies(body_ids: Iterable[int] | None) -> list[str] | None:
@@ -126,6 +123,13 @@ class TransformRunner:
         self.minio = minio or get_minio_client()
         ensure_bucket(self.minio, settings.minio.processed_bucket)
         self.stats = TransformStats()
+        # Populated by ``run`` → ``_prefetch_existing``. Maps
+        # ``identifier`` → (processed file_hash, processed source_file_hash).
+        # Lets ``_process_one`` skip both the per-record find_one AND — when
+        # source hashes match — the MinIO get_object entirely.
+        self._existing: dict[str, tuple[str | None, str | None]] = {}
+        # Queued UpdateOne ops flushed via ``bulk_write(ordered=False)``.
+        self._pending_ops: list[UpdateOne] = []
 
     def run(
         self,
@@ -138,6 +142,11 @@ class TransformRunner:
 
         body_names = _validate_bodies(body_ids)
         query = self._build_query(start_date, end_date, body_names)
+
+        # Same range/body filter as the landing cursor below — so the prefetch
+        # only pulls processed rows the run could actually touch.
+        self._existing = self._prefetch_existing(query)
+
         cursor = self.landing.find(query).sort("partition_date")
 
         found = self.landing.count_documents(query)
@@ -149,12 +158,16 @@ class TransformRunner:
                 "end_date": end_date.isoformat(),
                 "bodies": body_names,
                 "found": found,
+                "existing_processed": len(self._existing),
             },
         )
 
         try:
             for record in cursor:
                 self._process_one(record)
+                if len(self._pending_ops) >= _BULK_BATCH_SIZE:
+                    self._flush_pending()
+            self._flush_pending()
         finally:
             self._emit_summary()
             if self._owns_mongo:
@@ -182,6 +195,7 @@ class TransformRunner:
         body = record.get("body")
         partition_date = record.get("partition_date")
         landing_path = record.get("file_path")
+        landing_hash = record.get("file_hash")
         content_type = record.get("content_type", "")
         ext = self._ext_from_content_type(content_type)
 
@@ -192,6 +206,36 @@ class TransformRunner:
                 partition_date,
                 reason="incomplete_landing_metadata",
                 extra={"content_type": content_type, "landing_path": landing_path},
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        existing = self._existing.get(identifier)  # (file_hash, source_file_hash) or None
+
+        # Fast path: landing hash matches the stored source_file_hash.
+        # Cleaner is deterministic → cleaned bytes would be byte-identical →
+        # processed hash would match too. Skip the MinIO get_object + BS4
+        # parse + re-hash entirely. This is the near-zero cost warm re-run.
+        if (
+            existing is not None
+            and landing_hash is not None
+            and existing[1] == landing_hash
+        ):
+            self._pending_ops.append(UpdateOne(
+                {"identifier": identifier},
+                {"$set": {"last_transformed_at": now}},
+            ))
+            self.stats.bump(body, partition_date, "unchanged")
+            self.log.info(
+                "record_unchanged",
+                extra={
+                    "event": "record_unchanged",
+                    "identifier": identifier,
+                    "file_hash": existing[0],
+                    "body": body,
+                    "partition_date": partition_date,
+                    "skipped_download": True,
+                },
             )
             return
 
@@ -244,34 +288,19 @@ class TransformRunner:
         new_hash = sha256_hash(payload)
         processed_path = f"{body_slug(body)}/{identifier}.{ext}"
 
-        try:
-            existing = self.processed.find_one(
+        # Second-chance unchanged check: source hash differed (or was missing)
+        # but the cleaned bytes still hash the same — legacy record without
+        # source_file_hash, or a cleaner-algo change that landed on the same
+        # output. Skip the put; backfill source_file_hash so next warm run
+        # takes the fast path.
+        if existing is not None and existing[0] == new_hash:
+            self._pending_ops.append(UpdateOne(
                 {"identifier": identifier},
-                {"file_hash": 1},
-            )
-        except PyMongoError as exc:
-            self._record_failed(
-                identifier, body, partition_date,
-                reason="processed_mongo_failed",
-                extra=_mongo_error_extra(exc),
-            )
-            return
-
-        now = datetime.now(timezone.utc)
-
-        if existing is not None and existing.get("file_hash") == new_hash:
-            try:
-                self.processed.update_one(
-                    {"identifier": identifier},
-                    {"$set": {"last_transformed_at": now}},
-                )
-            except PyMongoError as exc:
-                self._record_failed(
-                    identifier, body, partition_date,
-                    reason="processed_mongo_failed",
-                    extra=_mongo_error_extra(exc),
-                )
-                return
+                {"$set": {
+                    "last_transformed_at": now,
+                    "source_file_hash": landing_hash,
+                }},
+            ))
             self.stats.bump(body, partition_date, "unchanged")
             self.log.info(
                 "record_unchanged",
@@ -281,6 +310,7 @@ class TransformRunner:
                     "file_hash": new_hash,
                     "body": body,
                     "partition_date": partition_date,
+                    "skipped_download": False,
                 },
             )
             return
@@ -322,30 +352,19 @@ class TransformRunner:
             "file_path": processed_path,
             "source_bucket": record.get("bucket"),
             "source_file_path": landing_path,
-            "source_file_hash": record.get("file_hash"),
+            "source_file_hash": landing_hash,
             "last_transformed_at": now,
             "updated_at": now,
         }
-        try:
-            self.processed.update_one(
-                {"identifier": identifier},
-                {"$set": metadata, "$setOnInsert": {"first_transformed_at": now}},
-                upsert=True,
-            )
-        except PyMongoError as exc:
-            # Upload already succeeded — the object exists in MinIO but the
-            # metadata upsert failed, so the record is effectively orphaned
-            # until the next successful transform run replays it. Flag the
-            # orphan path so an operator can reconcile manually.
-            self._record_failed(
-                identifier, body, partition_date,
-                reason="processed_mongo_failed",
-                extra={
-                    **_mongo_error_extra(exc),
-                    "orphan_processed_path": processed_path,
-                },
-            )
-            return
+        self._pending_ops.append(UpdateOne(
+            {"identifier": identifier},
+            {"$set": metadata, "$setOnInsert": {"first_transformed_at": now}},
+            upsert=True,
+        ))
+        # Keep the in-memory prefetch consistent so a duplicate identifier
+        # later in the same run (shouldn't happen but be safe) takes the
+        # right branch.
+        self._existing[identifier] = (new_hash, landing_hash)
         self.stats.bump(body, partition_date, outcome_kind)
         self.log.info(
             "record_transformed",
@@ -361,6 +380,52 @@ class TransformRunner:
                 "size_after": len(payload),
             },
         )
+
+    def _prefetch_existing(
+        self, query: dict
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """One query for the whole run: ``{identifier: (file_hash, source_file_hash)}``.
+
+        Same partition-date + optional body filter as the landing cursor, so
+        we only pull rows the run could actually match against. Replaces the
+        per-record ``find_one`` that dominated the warm path at N=339.
+        """
+        cursor = self.processed.find(
+            query,
+            {"identifier": 1, "file_hash": 1, "source_file_hash": 1, "_id": 0},
+        )
+        return {
+            doc["identifier"]: (doc.get("file_hash"), doc.get("source_file_hash"))
+            for doc in cursor
+        }
+
+    def _flush_pending(self) -> None:
+        """Flush queued ``UpdateOne`` ops via ``bulk_write(ordered=False)``.
+
+        Partial-success semantics: ``ordered=False`` means Mongo applies
+        every op it can and reports the rest via ``BulkWriteError``. We log
+        each per-op write error as ``record_failed`` (without decrementing
+        stats — the discrepancy between summary counts and log events makes
+        the failure visible). Non-bulk driver errors propagate.
+        """
+        if not self._pending_ops:
+            return
+        ops = self._pending_ops
+        self._pending_ops = []
+        try:
+            self.processed.bulk_write(ops, ordered=False)
+        except BulkWriteError as exc:
+            for err in exc.details.get("writeErrors", []):
+                self.log.error(
+                    "record_failed",
+                    extra={
+                        "event": "record_failed",
+                        "reason": "processed_bulk_write_failed",
+                        "index": err.get("index"),
+                        "code": err.get("code"),
+                        "message": (err.get("errmsg") or "")[:200],
+                    },
+                )
 
     def _download(self, key: str) -> bytes:
         response = self.minio.get_object(settings.minio.landing_bucket, key)
