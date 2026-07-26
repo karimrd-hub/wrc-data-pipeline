@@ -82,6 +82,7 @@ class MongoSettings:
     db: str
     landing_collection: str
     processed_collection: str
+    quarantine_collection: str
     server_selection_timeout_ms: int
     connect_timeout_ms: int
     socket_timeout_ms: int
@@ -93,6 +94,7 @@ class MongoSettings:
             db=_str("MONGO_DB", "wrc"),
             landing_collection=_str("MONGO_LANDING_COLLECTION", "landing_metadata"),
             processed_collection=_str("MONGO_PROCESSED_COLLECTION", "processed_metadata"),
+            quarantine_collection=_str("MONGO_QUARANTINE_COLLECTION", "quarantine_metadata"),
             server_selection_timeout_ms=_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 5000),
             connect_timeout_ms=_int("MONGO_CONNECT_TIMEOUT_MS", 5000),
             socket_timeout_ms=_int("MONGO_SOCKET_TIMEOUT_MS", 30000),
@@ -164,11 +166,16 @@ class ScraperSettings:
 @dataclass(frozen=True)
 class TransformSettings:
     bulk_batch_size: int
+    # Minimum size in bytes of the CLEANED payload before we consider a record
+    # legitimate. Below this we route to quarantine — WRC's error pages and
+    # session-timeout stubs are well under 1 KB, real decisions are 5 KB+.
+    min_content_bytes: int
 
     @classmethod
     def from_env(cls) -> "TransformSettings":
         return cls(
             bulk_batch_size=_int("TRANSFORM_BULK_BATCH_SIZE", 200),
+            min_content_bytes=_int("TRANSFORM_MIN_CONTENT_BYTES", 1024),
         )
 
 

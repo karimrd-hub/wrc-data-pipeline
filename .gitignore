@@ -38,6 +38,10 @@ Thumbs.db
 data/
 *.log
 
+# Benchmark raw event streams — bulky (18 MB+ for a 9000-record run).
+# Keep only summary.md + parallel.wall / *.time in bench/results/.
+bench/results/**/*.jsonl
+
 # Docker bind-mount volumes (if used later)
 .mongo-data/
 .minio-data/

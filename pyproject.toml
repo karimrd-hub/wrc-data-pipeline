@@ -13,9 +13,20 @@ dependencies = [
     "lxml>=5.0",
     "minio>=7.2.20",
     "pymongo>=4.17.0",
+    "pydantic>=2.0",
+    "pypdf>=4.0",
     "python-dotenv>=1.2.2",
     "scrapy>=2.17.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [build-system]
 requires = ["uv_build>=0.9.21,<0.10.0"]

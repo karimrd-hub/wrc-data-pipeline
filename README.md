@@ -119,6 +119,32 @@ uv run scrapy crawl wrc -a start_date=2026-01-01 -a end_date=2026-01-31 -a bodie
 uv run python -m wrc_pipeline.transform --start-date 2026-01-01 --end-date 2026-01-31 --bodies 3
 ```
 
+Unit tests (25 tests, one per task requirement plus data-quality extras):
+
+```bash
+uv sync --group dev
+uv run pytest tests/
+```
+
+## Benchmarks
+
+Reproducible benchmark harness under `bench/`, isolated from real state
+via a dedicated Mongo DB (`wrc_bench`) and MinIO buckets. Each run writes
+JSON logs + a `summary.md` to `bench/results/<label>/` for committable
+evidence. Full docs in `bench/README.md`. Milestone results in the repo:
+
+| label | shape | records | wall | rec/min |
+|---|---|---|---|---|
+| `t8` | 5yr LC only, target=8 | 2171 | 7:26 | 292 |
+| `par_t16` | 5yr LC only, target=16, 5 workers | 2170 | 3:22 | 644 |
+| `ymb_3yr_4bodies_c12t7` | 3yr × 4 bodies × 12 months, 144 workers cap=12, target=7 | 9025 | 15:01 | 601 |
+
+The `ymb_*` harness (`bench/run-parallel-ymb.sh`) is the mode that
+matches Dagster's fanout most closely: one Scrapy subprocess per
+`(year × month × body)`, joined by `wait` inside a single
+`docker compose run` invocation, with a concurrency cap so aggregate
+WRC load stays bounded regardless of partition count.
+
 ## Troubleshooting
 
 - **Docker BuildKit / uv wheel errors** — the base image is `python:3.11-slim`; if the build stalls on `lxml`, delete `.venv/` and retry with `docker compose build --no-cache app`.

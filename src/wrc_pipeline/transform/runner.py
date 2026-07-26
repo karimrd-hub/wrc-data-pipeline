@@ -11,31 +11,53 @@ Task requirements this module owns (docs/task.md, transformation script):
 * (c/iv) Write to the processed bucket.
 * (c/v) Upsert into the processed collection with the new path + new hash.
 
-Idempotency (task req 9 is a whole-pipeline requirement, not just scraper):
-two prefetched fields per already-processed identifier — ``file_hash`` (of
-the cleaned bytes) and ``source_file_hash`` (of the landing bytes we cleaned
-from). The cleaner is deterministic, so identical landing bytes always
-produce identical cleaned bytes; ``landing.file_hash == prefetched
-source_file_hash`` proves this record is unchanged without touching MinIO.
-That fast path is what makes a warm re-run near-free at reference volume.
-A second-chance check on the cleaned-hash catches "cleaner algo changed"
-and legacy records missing ``source_file_hash``.
+Data-quality additions on top of the task spec:
+
+* **Sibling ``{identifier}.txt``** — every processed document gets a
+  plain-text sibling extracted by ``transform.text`` (BS4 for HTML,
+  ``pypdf`` for PDF). The archived HTML/PDF stays untouched; the ``.txt``
+  is a *sibling*, not a replacement, so the "don't transform PDFs" rule
+  is respected. Downstream consumers (search, LLMs) read the sibling.
+* **Structured fields** — ``transform.extractor`` parses the cleaned HTML
+  for chair / parties / hearing_date / acts / € amounts and stores them
+  under ``processed_metadata.structured``. Best-effort: unknown-shape
+  pages produce mostly-``None`` fields, never a run failure.
+* **Schema validation** — every candidate row passes through
+  ``transform.validation.ProcessedRecord`` before the upsert. Failures
+  route to ``quarantine_metadata`` with the reason attached; a given
+  identifier is in exactly one of {processed, quarantine, neither}.
+
+Idempotency (task req 9):
+
+Three prefetched fields per already-processed identifier —
+``file_hash`` (of the cleaned bytes), ``source_file_hash`` (of the
+landing bytes we cleaned from), and ``transform_version`` (the cleaner /
+extractor generation that produced the row). The cleaner + extractor
+are deterministic, so identical landing bytes at the same
+transform_version always produce identical processed output;
+``landing.file_hash == prefetched source_file_hash AND
+version_match`` proves this record is unchanged without touching MinIO.
+Bumping ``TRANSFORM_VERSION`` triggers a one-time backfill on the next
+run and returns to the near-free warm path afterwards.
 
 Batched writes: pending ``UpdateOne`` ops are flushed via
-``bulk_write(ordered=False)`` every ``_BULK_BATCH_SIZE`` records (and once
-at the end). Turns the per-record round-trip into one round-trip per batch;
-essential to make the warm path collapse to seconds even at 1000x volume.
+``bulk_write(ordered=False)`` every ``TRANSFORM_BULK_BATCH_SIZE`` records
+(and once at the end). Turns the per-record round-trip into one round-trip
+per batch; essential to make the warm path collapse to seconds even at
+1000x volume.
 """
 
 from __future__ import annotations
 
+import io
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Iterable
+from typing import Optional
 
 from minio import Minio
 from minio.error import S3Error
+from pydantic import ValidationError
 from pymongo import UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import BulkWriteError
@@ -47,20 +69,25 @@ from wrc_pipeline.storage.hashing import sha256_hash
 from wrc_pipeline.storage.minio import ensure_bucket, get_minio_client
 from wrc_pipeline.storage.mongo import ensure_indexes, get_collection, get_mongo_client
 from wrc_pipeline.transform.cleaner import ContentNotFoundError, clean_html
+from wrc_pipeline.transform.extractor import extract_fields
+from wrc_pipeline.transform.text import html_to_text, pdf_to_text
+from wrc_pipeline.transform.validation import ProcessedRecord, build_quarantine_doc
 
 
-# Same mapping as the scraper pipeline — extension -> media type. Duplicated
-# rather than imported from ``scrapers.pipelines`` to keep the transform
-# module free of Scrapy imports (decisions.md §4.5).
+# Bump when the cleaner / extractor / text-extraction contract changes in
+# a way that would give a different processed output for the same landing
+# bytes. Guarded by the fast-path check below — a change here forces a
+# one-time reprocess of every existing row, then returns to warm-path
+# behaviour on the next run.
+TRANSFORM_VERSION = 2
+
+
 EXT_MIME = {
     "html": "text/html",
     "pdf": "application/pdf",
     "doc": "application/msword",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
-
-# Batch size lives in .env (``TRANSFORM_BULK_BATCH_SIZE``); default 200 keeps
-# peak memory bounded while still amortizing round-trip cost across many records.
 
 
 @dataclass
@@ -69,8 +96,9 @@ class TransformStats:
     unchanged: int = 0
     passthrough: int = 0
     failed: int = 0
+    quarantined: int = 0
     per_partition: dict[tuple[str, str], dict[str, int]] = field(
-        default_factory=lambda: defaultdict(_new_partition_counter)
+        default_factory=lambda: defaultdict(lambda: _new_partition_counter())
     )
 
     def bump(self, body: str, partition_date: str, outcome: str) -> None:
@@ -79,10 +107,16 @@ class TransformStats:
 
 
 def _new_partition_counter() -> dict[str, int]:
-    return {"transformed": 0, "unchanged": 0, "passthrough": 0, "failed": 0}
+    return {
+        "transformed": 0,
+        "unchanged": 0,
+        "passthrough": 0,
+        "failed": 0,
+        "quarantined": 0,
+    }
 
 
-def _validate_bodies(body_ids: Iterable[int] | None) -> list[str] | None:
+def _validate_bodies(body_ids: Optional[list[int]]) -> Optional[list[str]]:
     if body_ids is None:
         return None
     names = []
@@ -93,23 +127,30 @@ def _validate_bodies(body_ids: Iterable[int] | None) -> list[str] | None:
     return names
 
 
+@dataclass
+class _Existing:
+    """Prefetched state per identifier: three slots the fast-path uses."""
+    file_hash: Optional[str]
+    source_file_hash: Optional[str]
+    transform_version: Optional[int]
+
+
 class TransformRunner:
     """Orchestrates a single ``[start_date, end_date]`` transform run.
 
     Instances are single-use — one ``run()`` per instance keeps the Mongo /
-    MinIO clients scoped to a well-defined lifetime and avoids state leaking
-    across CLI invocations.
+    MinIO clients scoped to a well-defined lifetime.
     """
 
     def __init__(
         self,
-        landing_collection: Collection | None = None,
-        processed_collection: Collection | None = None,
-        minio: Minio | None = None,
+        landing_collection: Optional[Collection] = None,
+        processed_collection: Optional[Collection] = None,
+        quarantine_collection: Optional[Collection] = None,
+        minio: Optional[Minio] = None,
         mongo_client=None,
     ) -> None:
         self.log = get_json_logger("wrc.transform")
-        # Dependency-injectable for tests; defaults hit the shared config.
         self._owns_mongo = mongo_client is None and landing_collection is None
         self.mongo_client = mongo_client or get_mongo_client()
         self.landing = landing_collection or get_collection(
@@ -118,23 +159,22 @@ class TransformRunner:
         self.processed = processed_collection or get_collection(
             settings.mongo.processed_collection, self.mongo_client
         )
+        self.quarantine = quarantine_collection or get_collection(
+            settings.mongo.quarantine_collection, self.mongo_client
+        )
         ensure_indexes(self.processed)
+        ensure_indexes(self.quarantine)
         self.minio = minio or get_minio_client()
         ensure_bucket(self.minio, settings.minio.processed_bucket)
         self.stats = TransformStats()
-        # Populated by ``run`` → ``_prefetch_existing``. Maps
-        # ``identifier`` → (processed file_hash, processed source_file_hash).
-        # Lets ``_process_one`` skip both the per-record find_one AND — when
-        # source hashes match — the MinIO get_object entirely.
-        self._existing: dict[str, tuple[str | None, str | None]] = {}
-        # Queued UpdateOne ops flushed via ``bulk_write(ordered=False)``.
+        self._existing: dict[str, _Existing] = {}
         self._pending_ops: list[UpdateOne] = []
 
     def run(
         self,
         start_date: date,
         end_date: date,
-        body_ids: list[int] | None = None,
+        body_ids: Optional[list[int]] = None,
     ) -> TransformStats:
         if end_date < start_date:
             raise ValueError(f"end_date {end_date} is before start_date {start_date}")
@@ -142,12 +182,9 @@ class TransformRunner:
         body_names = _validate_bodies(body_ids)
         query = self._build_query(start_date, end_date, body_names)
 
-        # Same range/body filter as the landing cursor below — so the prefetch
-        # only pulls processed rows the run could actually touch.
         self._existing = self._prefetch_existing(query)
 
         cursor = self.landing.find(query).sort("partition_date")
-
         found = self.landing.count_documents(query)
         self.log.info(
             "transform_started",
@@ -158,6 +195,7 @@ class TransformRunner:
                 "bodies": body_names,
                 "found": found,
                 "existing_processed": len(self._existing),
+                "transform_version": TRANSFORM_VERSION,
             },
         )
 
@@ -178,7 +216,7 @@ class TransformRunner:
     # -- internals -----------------------------------------------------------
 
     def _build_query(
-        self, start_date: date, end_date: date, body_names: list[str] | None
+        self, start_date: date, end_date: date, body_names: Optional[list[str]]
     ) -> dict:
         q: dict = {
             "partition_date": {
@@ -210,16 +248,16 @@ class TransformRunner:
             return
 
         now = datetime.now(timezone.utc)
-        existing = self._existing.get(identifier)  # (file_hash, source_file_hash) or None
+        existing = self._existing.get(identifier)
 
-        # Fast path: landing hash matches the stored source_file_hash.
-        # Cleaner is deterministic → cleaned bytes would be byte-identical →
-        # processed hash would match too. Skip the MinIO get_object + BS4
-        # parse + re-hash entirely. This is the near-zero cost warm re-run.
+        # Fast path: unchanged landing bytes AND the row was produced at
+        # the current transform version. A version bump defeats the fast
+        # path for one run, letting cleaner/extractor changes propagate.
         if (
             existing is not None
             and landing_hash is not None
-            and existing[1] == landing_hash
+            and existing.source_file_hash == landing_hash
+            and existing.transform_version == TRANSFORM_VERSION
         ):
             self._pending_ops.append(UpdateOne(
                 {"identifier": identifier},
@@ -231,7 +269,7 @@ class TransformRunner:
                 extra={
                     "event": "record_unchanged",
                     "identifier": identifier,
-                    "file_hash": existing[0],
+                    "file_hash": existing.file_hash,
                     "body": body,
                     "partition_date": partition_date,
                     "skipped_download": True,
@@ -242,10 +280,6 @@ class TransformRunner:
         try:
             raw = self._download(landing_path)
         except S3Error as exc:
-            # S3-level error: object gone, forbidden, bucket missing. Per-record
-            # recoverable — log and skip. The bucket-level cases (NoSuchBucket,
-            # AccessDenied) will repeat for every record, which surfaces the
-            # infra issue via a burst of identical failures in the summary.
             self._record_failed(
                 identifier,
                 body,
@@ -261,6 +295,9 @@ class TransformRunner:
             )
             return
 
+        # Clean + extract + text-sibling depending on ext.
+        text_payload: Optional[bytes] = None
+        structured: Optional[dict] = None
         if ext == "html":
             try:
                 payload = clean_html(raw, identifier)
@@ -277,28 +314,69 @@ class TransformRunner:
                     },
                 )
                 return
+            text = html_to_text(payload)
+            text_payload = text.encode("utf-8") if text else None
+            structured = extract_fields(payload)
             outcome_kind = "transformed"
         else:
-            # PDF/DOC: task rule "don't apply any transformation". Passthrough
-            # bytes verbatim so the processed object is byte-identical to the
-            # landing object — file_hash therefore stays the same too.
+            # PDF/DOC passthrough — bytes go verbatim into the processed
+            # bucket; the .txt sibling is extracted separately (best-effort).
             payload = raw
+            if ext == "pdf":
+                pdf_text = pdf_to_text(raw)
+                text_payload = pdf_text.encode("utf-8") if pdf_text else None
+            structured = None
             outcome_kind = "passthrough"
 
         new_hash = sha256_hash(payload)
         processed_path = f"{body_slug(body)}/{identifier}.{ext}"
+        text_hash = sha256_hash(text_payload) if text_payload else None
+        text_path = f"{body_slug(body)}/{identifier}.txt" if text_payload else None
 
-        # Second-chance unchanged check: source hash differed (or was missing)
-        # but the cleaned bytes still hash the same — legacy record without
-        # source_file_hash, or a cleaner-algo change that landed on the same
-        # output. Skip the put; backfill source_file_hash so next warm run
-        # takes the fast path.
-        if existing is not None and existing[0] == new_hash:
+        # Validate BEFORE any upload — quarantine on failure so we don't
+        # write bytes for a row that isn't going into processed.
+        candidate = {
+            "identifier": identifier,
+            "body": body,
+            "body_id": record.get("body_id"),
+            "partition_date": partition_date,
+            "partition_end": record.get("partition_end"),
+            "date": record.get("date"),
+            "bucket": settings.minio.processed_bucket,
+            "file_path": processed_path,
+            "file_hash": new_hash,
+            "file_size": len(payload),
+            "content_type": content_type,
+            "text_file_path": text_path,
+            "text_file_hash": text_hash,
+            "text_size": len(text_payload) if text_payload else None,
+            "structured": structured,
+            "min_content_bytes": settings.transform.min_content_bytes,
+        }
+        try:
+            validated = ProcessedRecord(**candidate)
+        except ValidationError as exc:
+            self._quarantine(
+                identifier=identifier,
+                landing_record=record,
+                reason="schema_validation_failed",
+                details={"errors": exc.errors(include_url=False)},
+                now=now,
+            )
+            return
+
+        # Second-chance unchanged check on the cleaned/passthrough hash —
+        # covers the "cleaner algo changed but this record's output
+        # happens to hash the same" edge case, plus legacy rows without
+        # source_file_hash. Backfill both the source hash AND the
+        # transform_version so the next run takes the fast path.
+        if existing is not None and existing.file_hash == new_hash:
             self._pending_ops.append(UpdateOne(
                 {"identifier": identifier},
                 {"$set": {
                     "last_transformed_at": now,
                     "source_file_hash": landing_hash,
+                    "transform_version": TRANSFORM_VERSION,
                 }},
             ))
             self.stats.bump(body, partition_date, "unchanged")
@@ -334,37 +412,60 @@ class TransformRunner:
             )
             return
 
-        metadata = {
-            "identifier": identifier,
-            "title": record.get("title"),
-            "description": record.get("description"),
-            "date": record.get("date"),
-            "partition_date": partition_date,
-            "partition_end": record.get("partition_end"),
-            "body": body,
-            "body_id": record.get("body_id"),
+        if text_payload:
+            try:
+                self._upload(text_path, text_payload, "txt")
+            except S3Error as exc:
+                # Text sibling is nice-to-have — a failure to upload it
+                # shouldn't nuke the whole record. Null the fields and
+                # log; the processed row still lands with the archived
+                # HTML/PDF pointer intact.
+                self.log.warning(
+                    "text_sibling_upload_failed",
+                    extra={
+                        "event": "text_sibling_upload_failed",
+                        "identifier": identifier,
+                        "text_path": text_path,
+                        "error": type(exc).__name__,
+                        "s3_code": exc.code,
+                    },
+                )
+                text_payload = None
+                text_hash = None
+                text_path = None
+
+        metadata = validated.model_dump(exclude={"min_content_bytes"})
+        # Strip the None sibling fields when the upload failed post-validation.
+        if text_payload is None:
+            metadata["text_file_path"] = None
+            metadata["text_file_hash"] = None
+            metadata["text_size"] = None
+        metadata.update({
             "source_url": record.get("source_url"),
             "doc_url": record.get("doc_url"),
-            "content_type": content_type,
-            "file_hash": new_hash,
-            "file_size": len(payload),
-            "bucket": settings.minio.processed_bucket,
-            "file_path": processed_path,
             "source_bucket": record.get("bucket"),
             "source_file_path": landing_path,
             "source_file_hash": landing_hash,
+            "transform_version": TRANSFORM_VERSION,
+            "title": record.get("title"),
+            "description": record.get("description"),
             "last_transformed_at": now,
             "updated_at": now,
-        }
+        })
         self._pending_ops.append(UpdateOne(
             {"identifier": identifier},
             {"$set": metadata, "$setOnInsert": {"first_transformed_at": now}},
             upsert=True,
         ))
-        # Keep the in-memory prefetch consistent so a duplicate identifier
-        # later in the same run (shouldn't happen but be safe) takes the
-        # right branch.
-        self._existing[identifier] = (new_hash, landing_hash)
+        # If this identifier was previously quarantined, drop it from
+        # quarantine now that it validates — keeps the invariant that a
+        # given identifier lives in exactly one collection.
+        self.quarantine.delete_one({"identifier": identifier})
+        self._existing[identifier] = _Existing(
+            file_hash=new_hash,
+            source_file_hash=landing_hash,
+            transform_version=TRANSFORM_VERSION,
+        )
         self.stats.bump(body, partition_date, outcome_kind)
         self.log.info(
             "record_transformed",
@@ -373,41 +474,37 @@ class TransformRunner:
                 "identifier": identifier,
                 "file_path": processed_path,
                 "file_hash": new_hash,
+                "text_file_path": text_path,
                 "kind": outcome_kind,
                 "body": body,
                 "partition_date": partition_date,
                 "size_before": len(raw),
                 "size_after": len(payload),
+                "text_size": len(text_payload) if text_payload else 0,
             },
         )
 
-    def _prefetch_existing(
-        self, query: dict
-    ) -> dict[str, tuple[str | None, str | None]]:
-        """One query for the whole run: ``{identifier: (file_hash, source_file_hash)}``.
-
-        Same partition-date + optional body filter as the landing cursor, so
-        we only pull rows the run could actually match against. Replaces the
-        per-record ``find_one`` that dominated the warm path at N=339.
-        """
+    def _prefetch_existing(self, query: dict) -> dict[str, _Existing]:
         cursor = self.processed.find(
             query,
-            {"identifier": 1, "file_hash": 1, "source_file_hash": 1, "_id": 0},
+            {
+                "identifier": 1,
+                "file_hash": 1,
+                "source_file_hash": 1,
+                "transform_version": 1,
+                "_id": 0,
+            },
         )
         return {
-            doc["identifier"]: (doc.get("file_hash"), doc.get("source_file_hash"))
+            doc["identifier"]: _Existing(
+                file_hash=doc.get("file_hash"),
+                source_file_hash=doc.get("source_file_hash"),
+                transform_version=doc.get("transform_version"),
+            )
             for doc in cursor
         }
 
     def _flush_pending(self) -> None:
-        """Flush queued ``UpdateOne`` ops via ``bulk_write(ordered=False)``.
-
-        Partial-success semantics: ``ordered=False`` means Mongo applies
-        every op it can and reports the rest via ``BulkWriteError``. We log
-        each per-op write error as ``record_failed`` (without decrementing
-        stats — the discrepancy between summary counts and log events makes
-        the failure visible). Non-bulk driver errors propagate.
-        """
         if not self._pending_ops:
             return
         ops = self._pending_ops
@@ -427,6 +524,57 @@ class TransformRunner:
                     },
                 )
 
+    def _quarantine(
+        self,
+        identifier: str,
+        landing_record: dict,
+        reason: str,
+        details: dict,
+        now: datetime,
+    ) -> None:
+        """Route a candidate to the quarantine collection and remove any
+        existing processed row for the same identifier — a bad row must
+        not shadow a previously-good one."""
+        doc = build_quarantine_doc(
+            landing_record=landing_record, reason=reason, details=details, now=now
+        )
+        try:
+            self.quarantine.update_one(
+                {"identifier": identifier},
+                {
+                    "$set": doc,
+                    "$setOnInsert": {"first_quarantined_at": now},
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            # Quarantine write failed — still emit the log so nothing is
+            # lost, but don't crash the run over a single bad row.
+            self.log.error(
+                "quarantine_write_failed",
+                extra={
+                    "event": "quarantine_write_failed",
+                    "identifier": identifier,
+                    "reason": reason,
+                    "error": type(exc).__name__,
+                    "message": str(exc)[:200],
+                },
+            )
+        self.stats.bump(landing_record.get("body") or "?",
+                        landing_record.get("partition_date") or "?",
+                        "quarantined")
+        self.log.warning(
+            "record_quarantined",
+            extra={
+                "event": "record_quarantined",
+                "identifier": identifier,
+                "reason": reason,
+                "body": landing_record.get("body"),
+                "partition_date": landing_record.get("partition_date"),
+                "details": details,
+            },
+        )
+
     def _download(self, key: str) -> bytes:
         response = self.minio.get_object(settings.minio.landing_bucket, key)
         try:
@@ -436,17 +584,16 @@ class TransformRunner:
             response.release_conn()
 
     def _upload(self, key: str, payload: bytes, ext: str) -> None:
-        import io
-
+        content_type = EXT_MIME.get(ext, "text/plain" if ext == "txt" else "application/octet-stream")
         self.minio.put_object(
             settings.minio.processed_bucket,
             key,
             io.BytesIO(payload),
             length=len(payload),
-            content_type=EXT_MIME.get(ext, "application/octet-stream"),
+            content_type=content_type,
         )
 
-    def _ext_from_content_type(self, content_type: str) -> str | None:
+    def _ext_from_content_type(self, content_type: str) -> Optional[str]:
         ct = (content_type or "").split(";", 1)[0].strip().lower()
         for ext, mime in EXT_MIME.items():
             if ct == mime:
@@ -460,7 +607,7 @@ class TransformRunner:
         partition_date,
         *,
         reason: str,
-        extra: dict | None = None,
+        extra: Optional[dict] = None,
     ) -> None:
         self.stats.bump(body or "?", partition_date or "?", "failed")
         payload = {
@@ -493,5 +640,6 @@ class TransformRunner:
                 "unchanged": self.stats.unchanged,
                 "passthrough": self.stats.passthrough,
                 "failed": self.stats.failed,
+                "quarantined": self.stats.quarantined,
             },
         )
