@@ -21,16 +21,10 @@ Idempotency contract (task req 9):
     - **unchanged** — hash matches; skip MinIO put, refresh only
       ``last_seen_at`` in Mongo (proves the re-run visited this record).
 
-Concurrency:
-
-* Blocking I/O (Mongo, MinIO) is offloaded to Twisted's reactor threadpool via
-  ``deferToThread``. Without this the reactor stalls on every item's put/upsert
-  and stops dispatching new HTTP responses — measurable at the reference volume
-  and structurally load-bearing at 1000× scale.
 * An in-memory ``{identifier: file_hash}`` map is prefetched once in
   ``open_spider`` over the spider's requested date range. Change detection is a
-  dict lookup on the pipeline thread instead of a sequential ``find_one`` per
-  item; at 400 items that's 400 fewer Mongo round-trips gated on the reactor.
+  dict lookup instead of a sequential ``find_one`` per item; at 400 items
+  that's 400 fewer Mongo round-trips.
 
 Single class — the three steps (canonicalize+hash, upload, upsert) share
 state (existing hash decides whether we upload; the Mongo write needs the
@@ -41,7 +35,6 @@ state through the item for no benefit.
 from __future__ import annotations
 
 import io
-import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -50,7 +43,6 @@ from minio.error import S3Error
 from pymongo.errors import PyMongoError
 from scrapy import signals
 from scrapy.exceptions import DropItem
-from twisted.internet.threads import deferToThread
 
 from wrc_pipeline.config.settings import settings
 from wrc_pipeline.logging_setup import get_json_logger
@@ -75,12 +67,13 @@ _EXT_MIME = {v: k for k, v in CONTENT_TYPE_EXT.items()}
 # close_spider time — it's not one of the outcomes this pipeline itself owns.
 _PARTITION_OUTCOMES = ("inserted", "updated", "unchanged", "dropped", "failed")
 
-# Sentinel for the hash cache: distinguishes "identifier never seen" from
+# for the hash cache: distinguishes "identifier never seen" from
 # "identifier known but file_hash column is None" (legacy records written
 # before canonicalization landed).
 _MISSING = object()
 
 
+# Say the server returns Content-Type: text/html; charset=utf-8:
 def _ext_for(content_type: str) -> str | None:
     ct = (content_type or "").split(";", 1)[0].strip().lower()
     return CONTENT_TYPE_EXT.get(ct)
@@ -104,8 +97,8 @@ def _classify_pipeline_exception(exc: BaseException | None) -> tuple[str, dict]:
         return "mongo_write_failed", {}
     return "pipeline_exception", {}
 
-
 class StoragePipeline:
+    
     @classmethod
     def from_crawler(cls, crawler):
         obj = cls()
@@ -115,28 +108,29 @@ class StoragePipeline:
         # already counted below via ``dropped``).
         crawler.signals.connect(obj.on_item_error, signal=signals.item_error)
         return obj
-
-    def open_spider(self, spider):
-        self.log = get_json_logger("wrc.pipeline")
+    async def open_spider(self, spider):
+        self.log = get_json_logger("wrc.pipeline") #  All log lines from this pipeline will have "logger": "wrc.pipeline"
         self.mongo_client = get_mongo_client()
         self.collection = get_collection(settings.mongo.landing_collection, self.mongo_client)
-        ensure_indexes(self.collection)
+        await ensure_indexes(self.collection)
         self.minio = get_minio_client()
         ensure_bucket(self.minio, settings.minio.landing_bucket)
-        self.stats = {"inserted": 0, "updated": 0, "unchanged": 0, "dropped": 0}
+        self.stats = {"inserted": 0, "updated": 0, "unchanged": 0, "dropped": 0} # global total across the entire crawl {"event": "storage_summary", "inserted": 142, "updated": 3, "unchanged": 891, "dropped": 2}
+
         # per (body, partition_date_iso) counters — populated by process_item
         # and item_error, drained at close_spider into partition_summary events.
+
+        # {"event": "partition_summary", "body": "Labour Court", "partition_date": "2024-01-01", "inserted": 12, ...}
+        # {"event": "partition_summary", "body": "Labour Court", "partition_date": "2024-02-01", "inserted": 8, ...}
         self.partition_stats: dict[tuple[str, str], dict[str, int]] = defaultdict(
             _new_partition_counter
         )
-        # ``process_item`` now runs on the reactor threadpool via
-        # ``deferToThread``, so counter mutations and cache updates can race.
-        self._lock = threading.Lock()
         # One Mongo query per crawl instead of one ``find_one`` per item.
         # Assumes ``partition_date`` tagged on existing records overlaps the
         # spider's requested range — true whenever Dagster and the spider
         # agree on partition granularity (see ``SCRAPER_PARTITION_SIZE``).
-        self._hash_cache: dict[str, str | None] = self._prefetch_hashes(spider)
+        # prefetch {identifier → file_hash} pairs from Mongo so that per-item change detection (based on file_hash) is a dict lookup instead of a Mongo query per item.
+        self._hash_cache: dict[str, str | None] = await self._prefetch_hashes(spider)
         self.log.info(
             "hash_cache_prefetched",
             extra={
@@ -147,7 +141,7 @@ class StoragePipeline:
             },
         )
 
-    def _prefetch_hashes(self, spider) -> dict[str, str | None]:
+    async def _prefetch_hashes(self, spider) -> dict[str, str | None]:
         start = spider.range_start.isoformat()
         end = spider.range_end.isoformat()
         query: dict = {"partition_date": {"$gte": start, "$lte": end}}
@@ -162,13 +156,14 @@ class StoragePipeline:
             query,
             {"identifier": 1, "file_hash": 1, "_id": 0},
         )
-        return {doc["identifier"]: doc.get("file_hash") for doc in cursor}
+        return {doc["identifier"]: doc.get("file_hash") async for doc in cursor}
 
-    def close_spider(self, spider):
+    async def close_spider(self, spider):
         # Emit one partition_summary per (body, partition) covered by the run.
         # Union spider-side totals (records the search page said existed) with
         # pipeline-side outcomes so a reviewer can reconcile found vs scraped.
         totals: dict[tuple[str, str], int] = getattr(spider, "partition_totals", {})
+        # something wrong in parse_search
         row_failures: dict[tuple[str, str], int] = getattr(
             spider, "partition_row_failures", {}
         )
@@ -180,6 +175,7 @@ class StoragePipeline:
         http_failures: dict[tuple[str, str], int] = getattr(
             spider, "partition_http_failures", {}
         )
+    # produces a set of keys body: partition    keys = {("Labour Court", "2024-01-01"), ("WRC", "2024-01-01"), ("Labour Court", "2024-02-01")}
         keys = (
             set(totals)
             | set(self.partition_stats)
@@ -188,12 +184,16 @@ class StoragePipeline:
         )
         for key in sorted(keys):
             body, partition_date = key
+            # returns {"inserted": 10, "updated": 1, "unchanged": 0, "dropped": 0, "failed": 0} 
             counts = self.partition_stats.get(key, _new_partition_counter()).copy()
+            # # counts is now: {"inserted": 10, "updated": 1, "unchanged": 0, "dropped": 0, "failed": 0, "row_parse_failed": 1}
             counts["row_parse_failed"] = row_failures.get(key, 0)
+            # counts["failed"] already tracks pipeline-level failures such errors during MinIO upload or Mongo upsert
             counts["failed"] += http_failures.get(key, 0)
             found = totals.get(key, 0)
             scraped = counts["inserted"] + counts["updated"] + counts["unchanged"]
             self.log.info(
+                # for each partition (one month)
                 "partition_summary",
                 extra={
                     "event": "partition_summary",
@@ -213,7 +213,7 @@ class StoragePipeline:
                 **self.stats,
             },
         )
-        self.mongo_client.close()
+        await self.mongo_client.close()
 
     def on_item_error(self, item, response, spider, failure):
         adapter = ItemAdapter(item) if item is not None else None
@@ -221,8 +221,7 @@ class StoragePipeline:
         partition_date = adapter.get("partition_date") if adapter else None
         exc = failure.value if failure else None
         reason, extra_fields = _classify_pipeline_exception(exc)
-        with self._lock:
-            self._bump_partition(body, partition_date, "failed")
+        self._bump_partition(body, partition_date, "failed")
         self.log.error(
             "record_failed",
             extra={
@@ -238,15 +237,7 @@ class StoragePipeline:
             },
         )
 
-    def process_item(self, item, spider):
-        # Offload the blocking Mongo/MinIO calls to the reactor threadpool so
-        # the downloader keeps fetching while an item persists. Returning the
-        # Deferred is the pattern Scrapy pipelines already support — DropItem
-        # raised inside the thread propagates through the Failure and is
-        # handled by Scrapy's usual drop-item accounting.
-        return deferToThread(self._process_item_sync, item, spider)
-
-    def _process_item_sync(self, item, spider):
+    async def process_item(self, item, spider):
         adapter = ItemAdapter(item)
         payload: bytes = adapter.get("_body_bytes") or b""
         identifier = adapter.get("identifier")
@@ -256,7 +247,7 @@ class StoragePipeline:
 
         if not payload:
             self._record_dropped(body, partition_date, "empty_body", identifier, doc_url)
-            raise DropItem(f"empty body identifier={identifier} url={doc_url}")
+            raise DropItem(f"empty body identifier={identifier} url={doc_url}") # signal
 
         ext = _ext_for(adapter.get("content_type", ""))
         if ext is None:
@@ -283,6 +274,7 @@ class StoragePipeline:
         # data in the Landing Zone"). Suffixing file_hash means a real content
         # change writes a new object instead of overwriting the previous
         # bytes. Same content -> same key -> idempotent no-op.
+        # produces labour_court/2024-01/TED2616-a3f9b7c2d1e4.html
         object_path = (
             f"{body_slug(body)}/{partition_month}/"
             f"{identifier}-{file_hash[:12]}.{ext}"
@@ -297,13 +289,12 @@ class StoragePipeline:
         unchanged = existed and cached_hash == file_hash
 
         if unchanged:
-            self.collection.update_one(
+            await self.collection.update_one(
                 {"identifier": identifier},
                 {"$set": {"last_seen_at": now}},
             )
-            with self._lock:
-                self.stats["unchanged"] += 1
-                self._bump_partition(body, partition_date, "unchanged")
+            self.stats["unchanged"] += 1
+            self._bump_partition(body, partition_date, "unchanged")
             self.log.info(
                 "record_unchanged",
                 extra={
@@ -319,6 +310,7 @@ class StoragePipeline:
             adapter["file_path"] = object_path
             return item
 
+        # executes for both inserted (new) and updated (changed hash)
         self.minio.put_object(
             settings.minio.landing_bucket,
             object_path,
@@ -351,16 +343,16 @@ class StoragePipeline:
             "last_seen_at": now,
             "updated_at": now,
         }
-        self.collection.update_one(
+        await self.collection.update_one(
             {"identifier": identifier},
+            # $setOnInsert only updates the field first_scraped_at when the item is inserted for first time
             {"$set": metadata, "$setOnInsert": {"first_scraped_at": now}},
             upsert=True,
         )
         outcome = "inserted" if not existed else "updated"
-        with self._lock:
-            self.stats[outcome] += 1
-            self._bump_partition(body, partition_date, outcome)
-            self._hash_cache[identifier] = file_hash
+        self.stats[outcome] += 1
+        self._bump_partition(body, partition_date, outcome)
+        self._hash_cache[identifier] = file_hash
         self.log.info(
             "record_stored",
             extra={
@@ -391,9 +383,8 @@ class StoragePipeline:
         url,
         **extra,
     ) -> None:
-        with self._lock:
-            self.stats["dropped"] += 1
-            self._bump_partition(body, partition_date, "dropped")
+        self.stats["dropped"] += 1
+        self._bump_partition(body, partition_date, "dropped")
         self.log.warning(
             "record_dropped",
             extra={
