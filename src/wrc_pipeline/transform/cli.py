@@ -17,6 +17,7 @@ JSON events), and non-zero on argument-parsing / startup errors.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from datetime import date
 
@@ -62,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     body_ids = _parse_bodies(args.bodies)
     runner = TransformRunner()
-    stats = runner.run(args.start_date, args.end_date, body_ids=body_ids)
+    stats = asyncio.run(runner.run(args.start_date, args.end_date, body_ids=body_ids))
     # 2 chosen (not 1) so caller can distinguish "per-record failures" from
     # generic "something crashed at startup" via the standard argparse code.
     return 2 if stats.failed > 0 else 0

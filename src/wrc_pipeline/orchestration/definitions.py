@@ -105,6 +105,7 @@ def landing_records(context) -> dg.MaterializeResult:
     # Line-buffered Popen + live drain so Dagit shows crawl progress as it
     # happens, not only after the subprocess exits. Each line is already a
     # JSON event (see ``logging_setup.install_json_root_logging``).
+    # scrapy process
     proc = subprocess.Popen(
         cmd,
         cwd=str(_REPO_ROOT),
@@ -118,6 +119,7 @@ def landing_records(context) -> dg.MaterializeResult:
     # Read stdout on a worker thread so the main thread can enforce a
     # wall-clock timeout with ``proc.wait(timeout=...)``. A blocking ``for
     # line in proc.stdout`` on the main thread would swallow the timeout.
+    # daemon=True: Python kills the daemon thread automatically without waiting for it to finish draining the pipe in case the Dagster main Thread exits 
     reader = threading.Thread(
         target=_drain_stdout, args=(proc, context), daemon=True,
     )
@@ -129,6 +131,7 @@ def landing_records(context) -> dg.MaterializeResult:
     except subprocess.TimeoutExpired:
         proc.terminate()
         try:
+            # gives it 15 seconds to actually die after the SIGTERM.
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -171,7 +174,7 @@ def landing_records(context) -> dg.MaterializeResult:
     group_name="wrc",
     description="Cleaned + renamed WRC decisions for one (month × body) partition.",
 )
-def processed_records(context) -> dg.MaterializeResult:
+async def processed_records(context) -> dg.MaterializeResult:
     """Run the transform for one (month × body) partition.
 
     Called in-process because the runner is plain Python — no reactor
@@ -183,7 +186,7 @@ def processed_records(context) -> dg.MaterializeResult:
     )
 
     runner = TransformRunner()
-    stats = runner.run(start_d, end_d, body_ids=[body_id])
+    stats = await runner.run(start_d, end_d, body_ids=[body_id])
 
     if stats.failed > 0:
         # Per-record failures are already logged as ``record_failed`` events

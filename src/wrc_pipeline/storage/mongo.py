@@ -16,14 +16,14 @@ Index rationale (decisions.md §4.2):
 
 from __future__ import annotations
 
-from pymongo import ASCENDING, MongoClient
-from pymongo.collection import Collection
+from pymongo import ASCENDING, AsyncMongoClient
+from pymongo.asynchronous.collection import AsyncCollection
 
 from wrc_pipeline.config.settings import settings
 
 
-def get_mongo_client(uri: str | None = None) -> MongoClient:
-    return MongoClient(
+def get_mongo_client(uri: str | None = None) -> AsyncMongoClient:
+    return AsyncMongoClient(
         uri or settings.mongo.uri,
         serverSelectionTimeoutMS=settings.mongo.server_selection_timeout_ms,
         connectTimeoutMS=settings.mongo.connect_timeout_ms,
@@ -31,16 +31,16 @@ def get_mongo_client(uri: str | None = None) -> MongoClient:
     )
 
 
-def get_collection(name: str, client: MongoClient | None = None) -> Collection:
+def get_collection(name: str, client: AsyncMongoClient | None = None) -> AsyncCollection:
     client = client or get_mongo_client()
     return client[settings.mongo.db][name]
 
 
-def ensure_indexes(collection: Collection) -> None:
+async def ensure_indexes(collection: AsyncCollection) -> None:
     # Same index set for landing and processed — both are queried by
     # identifier (idempotency), partition_date (range scans), file_hash
     # (dedup audits), and body (per-tribunal reports).
-    collection.create_index([("identifier", ASCENDING)], unique=True, name="identifier_unique")
-    collection.create_index([("partition_date", ASCENDING)], name="partition_date_idx")
-    collection.create_index([("file_hash", ASCENDING)], name="file_hash_idx")
-    collection.create_index([("body", ASCENDING)], name="body_idx")
+    await collection.create_index([("identifier", ASCENDING)], unique=True, name="identifier_unique")
+    await collection.create_index([("partition_date", ASCENDING)], name="partition_date_idx")
+    await collection.create_index([("file_hash", ASCENDING)], name="file_hash_idx")
+    await collection.create_index([("body", ASCENDING)], name="body_idx")

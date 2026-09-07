@@ -59,7 +59,7 @@ from minio import Minio
 from minio.error import S3Error
 from pydantic import ValidationError
 from pymongo import UpdateOne
-from pymongo.collection import Collection
+from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.errors import BulkWriteError
 
 from wrc_pipeline.config.settings import settings
@@ -98,6 +98,7 @@ class TransformStats:
     failed: int = 0
     quarantined: int = 0
     per_partition: dict[tuple[str, str], dict[str, int]] = field(
+        # will produce { ("Body A", "2024-01"): {"transformed": 0, "unchanged": 0, "passthrough": 0, "failed": 0, "quarantined": 0,} }
         default_factory=lambda: defaultdict(lambda: _new_partition_counter())
     )
 
@@ -144,13 +145,15 @@ class TransformRunner:
 
     def __init__(
         self,
-        landing_collection: Optional[Collection] = None,
-        processed_collection: Optional[Collection] = None,
-        quarantine_collection: Optional[Collection] = None,
+        # reference to the landing_metadata not the collection itself 
+        landing_collection: Optional[AsyncCollection] = None,
+        processed_collection: Optional[AsyncCollection] = None,
+        quarantine_collection: Optional[AsyncCollection] = None,
         minio: Optional[Minio] = None,
         mongo_client=None,
     ) -> None:
         self.log = get_json_logger("wrc.transform")
+        # _owns_mongo = True means that TransformRunner created the mongo client connection and owns the lifecycle management 
         self._owns_mongo = mongo_client is None and landing_collection is None
         self.mongo_client = mongo_client or get_mongo_client()
         self.landing = landing_collection or get_collection(
@@ -162,15 +165,13 @@ class TransformRunner:
         self.quarantine = quarantine_collection or get_collection(
             settings.mongo.quarantine_collection, self.mongo_client
         )
-        ensure_indexes(self.processed)
-        ensure_indexes(self.quarantine)
         self.minio = minio or get_minio_client()
-        ensure_bucket(self.minio, settings.minio.processed_bucket)
         self.stats = TransformStats()
+        # empty now, wil be populted by _prefetch_existing
         self._existing: dict[str, _Existing] = {}
         self._pending_ops: list[UpdateOne] = []
 
-    def run(
+    async def run(
         self,
         start_date: date,
         end_date: date,
@@ -179,13 +180,17 @@ class TransformRunner:
         if end_date < start_date:
             raise ValueError(f"end_date {end_date} is before start_date {start_date}")
 
+        await ensure_indexes(self.processed)
+        await ensure_indexes(self.quarantine)
+        ensure_bucket(self.minio, settings.minio.processed_bucket)
+
         body_names = _validate_bodies(body_ids)
         query = self._build_query(start_date, end_date, body_names)
 
-        self._existing = self._prefetch_existing(query)
+        self._existing = await self._prefetch_existing(query)
 
         cursor = self.landing.find(query).sort("partition_date")
-        found = self.landing.count_documents(query)
+        found = await self.landing.count_documents(query)
         self.log.info(
             "transform_started",
             extra={
@@ -198,18 +203,18 @@ class TransformRunner:
                 "transform_version": TRANSFORM_VERSION,
             },
         )
-
+        # 200 transformed records metadata that will be upsert to mongo at once
         batch_size = settings.transform.bulk_batch_size
         try:
-            for record in cursor:
-                self._process_one(record)
+            async for record in cursor:
+                await self._process_one(record)
                 if len(self._pending_ops) >= batch_size:
-                    self._flush_pending()
-            self._flush_pending()
+                    await self._flush_pending()
+            await self._flush_pending()
         finally:
             self._emit_summary()
             if self._owns_mongo:
-                self.mongo_client.close()
+                await self.mongo_client.close()
 
         return self.stats
 
@@ -228,7 +233,7 @@ class TransformRunner:
             q["body"] = {"$in": body_names}
         return q
 
-    def _process_one(self, record: dict) -> None:
+    async def _process_one(self, record: dict) -> None:
         identifier = record.get("identifier")
         body = record.get("body")
         partition_date = record.get("partition_date")
@@ -259,6 +264,7 @@ class TransformRunner:
             and existing.source_file_hash == landing_hash
             and existing.transform_version == TRANSFORM_VERSION
         ):
+            #  will be sent to MongoDB only when the batch reaches batch_size (or at the end of the run via _flush_pending()) and this is way we are using UpdateOne (it is pymongo object describing the operation without executing it itself)
             self._pending_ops.append(UpdateOne(
                 {"identifier": identifier},
                 {"$set": {"last_transformed_at": now}},
@@ -293,6 +299,7 @@ class TransformRunner:
                     "error_message": str(exc)[:200],
                 },
             )
+            # _process_one() early — if the MinIO download failed, there's nothing to clean, validate or upload
             return
 
         # Clean + extract + text-sibling depending on ext.
@@ -315,6 +322,7 @@ class TransformRunner:
                 )
                 return
             text = html_to_text(payload)
+            # .encode("utf-8") converts the string to bytes
             text_payload = text.encode("utf-8") if text else None
             structured = extract_fields(payload)
             outcome_kind = "transformed"
@@ -351,12 +359,13 @@ class TransformRunner:
             "text_file_hash": text_hash,
             "text_size": len(text_payload) if text_payload else None,
             "structured": structured,
+            #  minimum acceptable file size
             "min_content_bytes": settings.transform.min_content_bytes,
         }
         try:
             validated = ProcessedRecord(**candidate)
         except ValidationError as exc:
-            self._quarantine(
+            await self._quarantine(
                 identifier=identifier,
                 landing_record=record,
                 reason="schema_validation_failed",
@@ -370,6 +379,11 @@ class TransformRunner:
         # happens to hash the same" edge case, plus legacy rows without
         # source_file_hash. Backfill both the source hash AND the
         # transform_version so the next run takes the fast path.
+
+        # On the slow path, the record went through the full pipeline (download → clean → hash). But the resulting new_hash matches existing.file_hash — meaning the processed output is identical to what's already stored.
+        # The problem is this record might be missing source_file_hash or transform_version in processed_metadata (legacy rows, or first time this check runs). So even though nothing changed, next run would trigger the slow path again unnecessarily.
+        # By setting source_file_hash = landing_hash and transform_version = TRANSFORM_VERSION now, next run's fast-path check will pass and skip the slow path entirely.
+
         if existing is not None and existing.file_hash == new_hash:
             self._pending_ops.append(UpdateOne(
                 {"identifier": identifier},
@@ -434,8 +448,10 @@ class TransformRunner:
                 text_hash = None
                 text_path = None
 
+        # converts the Pydantic ProcessedRecord instance back to a plain dict, ready to be stored in MongoDB
         metadata = validated.model_dump(exclude={"min_content_bytes"})
         # Strip the None sibling fields when the upload failed post-validation.
+        # for handling a race condition: validated by pydantic may have text_file_path/text_file_hash/text_size set, but the actual file never made it to MinIO. These three fields are manually nulled out to keep MongoDB consistent with what actually exists in MinIO.
         if text_payload is None:
             metadata["text_file_path"] = None
             metadata["text_file_hash"] = None
@@ -460,7 +476,7 @@ class TransformRunner:
         # If this identifier was previously quarantined, drop it from
         # quarantine now that it validates — keeps the invariant that a
         # given identifier lives in exactly one collection.
-        self.quarantine.delete_one({"identifier": identifier})
+        await self.quarantine.delete_one({"identifier": identifier})
         self._existing[identifier] = _Existing(
             file_hash=new_hash,
             source_file_hash=landing_hash,
@@ -484,7 +500,7 @@ class TransformRunner:
             },
         )
 
-    def _prefetch_existing(self, query: dict) -> dict[str, _Existing]:
+    async def _prefetch_existing(self, query: dict) -> dict[str, _Existing]:
         cursor = self.processed.find(
             query,
             {
@@ -501,16 +517,16 @@ class TransformRunner:
                 source_file_hash=doc.get("source_file_hash"),
                 transform_version=doc.get("transform_version"),
             )
-            for doc in cursor
+            async for doc in cursor
         }
 
-    def _flush_pending(self) -> None:
+    async def _flush_pending(self) -> None:
         if not self._pending_ops:
             return
         ops = self._pending_ops
         self._pending_ops = []
         try:
-            self.processed.bulk_write(ops, ordered=False)
+            await self.processed.bulk_write(ops, ordered=False)
         except BulkWriteError as exc:
             for err in exc.details.get("writeErrors", []):
                 self.log.error(
@@ -524,7 +540,7 @@ class TransformRunner:
                     },
                 )
 
-    def _quarantine(
+    async def _quarantine(
         self,
         identifier: str,
         landing_record: dict,
@@ -539,7 +555,7 @@ class TransformRunner:
             landing_record=landing_record, reason=reason, details=details, now=now
         )
         try:
-            self.quarantine.update_one(
+            await self.quarantine.update_one(
                 {"identifier": identifier},
                 {
                     "$set": doc,
@@ -575,6 +591,7 @@ class TransformRunner:
             },
         )
 
+# key is the MinIO object path — e.g. "wrc/ADJ-00001-a3f9b2c1d4e5.html".
     def _download(self, key: str) -> bytes:
         response = self.minio.get_object(settings.minio.landing_bucket, key)
         try:
@@ -588,6 +605,7 @@ class TransformRunner:
         self.minio.put_object(
             settings.minio.processed_bucket,
             key,
+            # MinIO's put_object() expects a file-like object (something it can read from), not raw bytes
             io.BytesIO(payload),
             length=len(payload),
             content_type=content_type,
