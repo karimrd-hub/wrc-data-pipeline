@@ -16,3 +16,18 @@ class WrcItem(scrapy.Item):
     content_type = scrapy.Field()    # Content-Type header of the detail response (drives extension)
     scraped_at = scrapy.Field()      # UTC ISO-8601 timestamp of when the record was scraped
     _body_bytes = scrapy.Field()     # transient raw bytes of the document, stripped by FileStoragePipeline
+
+
+class OigItem(scrapy.Item):
+    opinion_id = scrapy.Field()     # e.g. "24-13" — unique identifier, derived from URL path
+    year = scrapy.Field()           # partition key (int), from browse URL ?year-posted=YYYY
+    status = scrapy.Field()         # Issued / Issued with Modifications / Rescinded / Terminated
+    outcome = scrapy.Field()        # Favorable / Unfavorable — absent on Rescinded/Terminated
+    posted_date = scrapy.Field()    # as shown on site, e.g. "December 30, 2024"
+    last_updated = scrapy.Field()   # present only when opinion was modified or terminated
+    summary = scrapy.Field()        # brief arrangement description from the browse card
+    detail_url = scrapy.Field()     # full URL of the opinion detail page
+    documents = scrapy.Field()      # list of {url, label, file_size_str} — all PDFs for this opinion
+    updates = scrapy.Field()        # list of {date, text} post-publication notices, or None
+    scraped_at = scrapy.Field()     # UTC ISO-8601 timestamp
+    _pdf_bytes = scrapy.Field()     # transient: list of bytes (or None on download failure), parallel to documents

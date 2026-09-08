@@ -22,6 +22,7 @@ services:
     image: minio/minio:latest
     container_name: wrc-minio
     restart: unless-stopped
+    #  starts the  server storing data in /data and fixes the web console on port 9001 so the port binding 9001:9001 always works.
     command: server /data --console-address ":9001"
     ports:
       - "${MINIO_API_PORT:-9000}:9000"

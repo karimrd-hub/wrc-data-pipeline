@@ -7,7 +7,7 @@
 # builder cache survive source-only edits.
 
 FROM python:3.11-slim AS builder
-
+# copy UV deps into /opt/venv and compile the deps 
 ENV UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_COMPILE_BYTECODE=1

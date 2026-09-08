@@ -29,12 +29,13 @@ import re
 
 # One entry per known volatile marker. Order-independent; substitutions are
 # idempotent, so re-running the whole list is cheap.
+# re.DOTALL makes . match newlines too, in case the comment spans multiple lines.
 _VOLATILE_HTML_MARKERS: tuple[re.Pattern[bytes], ...] = (
-    re.compile(rb"<!--\s*Elapsed time:[^>]*?-->", re.DOTALL),
-    re.compile(rb"<!--\s*cached or not being index\.aspx page\s*-->", re.DOTALL),
+    re.compile(rb"<!--\s*Elapsed time:[^>]*?-->", re.DOTALL), # server render time, varies on every request
+    re.compile(rb"<!--\s*cached or not being index\.aspx page\s*-->", re.DOTALL), # appears only on cache-cold responses
 )
 
-
+# sha256 bcz it is collision resistant, stable
 def sha256_hash(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 

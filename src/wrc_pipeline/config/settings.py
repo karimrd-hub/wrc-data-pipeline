@@ -41,7 +41,7 @@ def _bool(name: str, default: bool) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
 
-
+# allows UA from .env to override for flexibility _DEFAULT_USER_AGENT_POOL
 def _pipe_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Parse a pipe-separated list from the env, falling back to ``default``.
 
@@ -115,6 +115,7 @@ class MongoSettings:
     landing_collection: str
     processed_collection: str
     quarantine_collection: str
+    oig_landing_collection: str
     server_selection_timeout_ms: int
     connect_timeout_ms: int
     socket_timeout_ms: int
@@ -127,6 +128,7 @@ class MongoSettings:
             landing_collection=_str("MONGO_LANDING_COLLECTION", "landing_metadata"),
             processed_collection=_str("MONGO_PROCESSED_COLLECTION", "processed_metadata"),
             quarantine_collection=_str("MONGO_QUARANTINE_COLLECTION", "quarantine_metadata"),
+            oig_landing_collection=_str("MONGO_OIG_LANDING_COLLECTION", "oig_landing_metadata"),
             server_selection_timeout_ms=_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 5000),
             connect_timeout_ms=_int("MONGO_CONNECT_TIMEOUT_MS", 5000),
             socket_timeout_ms=_int("MONGO_SOCKET_TIMEOUT_MS", 30000),

@@ -49,7 +49,7 @@ from wrc_pipeline.logging_setup import get_json_logger
 from wrc_pipeline.scrapers.utils.bodies import body_slug
 from wrc_pipeline.storage.hashing import canonicalize_html, sha256_hash
 from wrc_pipeline.storage.minio import ensure_bucket, get_minio_client
-from wrc_pipeline.storage.mongo import ensure_indexes, get_collection, get_mongo_client
+from wrc_pipeline.storage.mongo import ensure_indexes, ensure_oig_indexes, get_collection, get_mongo_client
 
 
 # Content-Type prefix -> extension. Small & explicit; unknown types drop the
@@ -397,3 +397,148 @@ class StoragePipeline:
                 **extra,
             },
         )
+
+
+class OigStoragePipeline:
+    """Hash + MinIO upload + MongoDB upsert for OIG advisory opinions.
+
+    Each opinion can carry multiple PDFs (original + modification/termination
+    documents). All of them are stored; _pdf_bytes[i] corresponds to
+    documents[i]. A None entry means that PDF download failed — the document
+    metadata is still recorded in Mongo but file_path / file_hash are null.
+
+    Unique index on opinion_id provides idempotency: re-running the same
+    year overwrites metadata and re-uploads only changed files.
+    """
+
+    async def open_spider(self, spider):
+        self.log = get_json_logger("oig.pipeline")
+        self.mongo_client = get_mongo_client()
+        self.collection = get_collection(
+            settings.mongo.oig_landing_collection, self.mongo_client
+        )
+        await ensure_oig_indexes(self.collection)
+        self.minio = get_minio_client()
+        ensure_bucket(self.minio, settings.minio.landing_bucket)
+        self.stats = {"stored": 0, "failed": 0}
+
+    async def close_spider(self, spider):
+        self.log.info(
+            "oig_storage_summary",
+            extra={
+                "event": "oig_storage_summary",
+                "year": spider.year,
+                "total_found": spider.total_found,
+                "http_failures": spider.http_failures,
+                **self.stats,
+            },
+        )
+        await self.mongo_client.close()
+
+    async def process_item(self, item, spider):
+        from wrc_pipeline.scrapers.items import OigItem
+        if not isinstance(item, OigItem):
+            return item
+
+        opinion_id = item["opinion_id"]
+        year = item["year"]
+        documents = item.get("documents") or []
+        pdf_bytes_list = item.get("_pdf_bytes") or []
+        now = datetime.now(timezone.utc)
+
+        stored_documents = []
+        for i, doc_meta in enumerate(documents):
+            pdf_bytes = pdf_bytes_list[i] if i < len(pdf_bytes_list) else None
+            if pdf_bytes is None:
+                stored_documents.append(
+                    {**doc_meta, "file_path": None, "file_hash": None, "file_size": None}
+                )
+                continue
+
+            filename = doc_meta["url"].rstrip("/").split("/")[-1]
+            file_hash = sha256_hash(pdf_bytes)
+            object_path = f"oig/{year}/{opinion_id}/{filename}"
+
+            try:
+                self.minio.put_object(
+                    settings.minio.landing_bucket,
+                    object_path,
+                    io.BytesIO(pdf_bytes),
+                    length=len(pdf_bytes),
+                    content_type="application/pdf",
+                )
+            except S3Error as exc:
+                self.log.error(
+                    "pdf_upload_failed",
+                    extra={
+                        "event": "pdf_upload_failed",
+                        "opinion_id": opinion_id,
+                        "object_path": object_path,
+                        "s3_code": exc.code,
+                        "error_message": str(exc)[:200],
+                    },
+                )
+                stored_documents.append(
+                    {**doc_meta, "file_path": None, "file_hash": None, "file_size": None}
+                )
+                continue
+
+            stored_documents.append(
+                {
+                    **doc_meta,
+                    "file_path": object_path,
+                    "file_hash": file_hash,
+                    "file_size": len(pdf_bytes),
+                }
+            )
+
+        metadata = {
+            "opinion_id": opinion_id,
+            "year": year,
+            "status": item.get("status"),
+            "outcome": item.get("outcome"),
+            "posted_date": item.get("posted_date"),
+            "last_updated": item.get("last_updated"),
+            "summary": item.get("summary"),
+            "detail_url": item.get("detail_url"),
+            "documents": stored_documents,
+            "updates": item.get("updates"),
+            "scraped_at": item.get("scraped_at"),
+            "bucket": settings.minio.landing_bucket,
+            "last_seen_at": now,
+            "updated_at": now,
+        }
+
+        try:
+            await self.collection.update_one(
+                {"opinion_id": opinion_id},
+                {"$set": metadata, "$setOnInsert": {"first_scraped_at": now}},
+                upsert=True,
+            )
+        except PyMongoError as exc:
+            self.stats["failed"] += 1
+            self.log.error(
+                "opinion_upsert_failed",
+                extra={
+                    "event": "opinion_upsert_failed",
+                    "opinion_id": opinion_id,
+                    "error": type(exc).__name__,
+                    "error_message": str(exc)[:200],
+                },
+            )
+            return item
+
+        self.stats["stored"] += 1
+        self.log.info(
+            "opinion_stored",
+            extra={
+                "event": "opinion_stored",
+                "opinion_id": opinion_id,
+                "year": year,
+                "status": item.get("status"),
+                "outcome": item.get("outcome"),
+                "documents_count": len(stored_documents),
+                "bucket": settings.minio.landing_bucket,
+            },
+        )
+        return item

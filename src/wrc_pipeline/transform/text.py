@@ -40,6 +40,7 @@ def html_to_text(payload: bytes) -> str:
     """
     soup = BeautifulSoup(payload, "lxml")
     raw = soup.get_text("\n", strip=True)
+    # the next 3 lines: 1- normalizes unicode into canonical form 2- spaces/tabs collapse to 1 space 3- 3 lines space between paragraphs becomes 2  
     normalized = unicodedata.normalize("NFC", raw)
     normalized = _WS_RUN.sub(" ", normalized)
     normalized = _BLANK_LINE_RUN.sub("\n\n", normalized)

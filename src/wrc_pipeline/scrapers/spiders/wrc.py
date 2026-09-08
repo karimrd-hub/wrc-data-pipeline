@@ -13,7 +13,7 @@ from wrc_pipeline.scrapers.utils.dates import iter_partitions, parse_iso, to_sit
 
 SEARCH_PATH = "/en/search/"
 RESULTS_PER_PAGE = 10  # site pagination window
-TOTAL_RE = re.compile(r"of\s+(\d+)\s+results", re.IGNORECASE)
+TOTAL_RE = re.compile(r"of\s+(\d+)\s+results", re.IGNORECASE) #"Showing 1-10 of 47 results" 
 
 # Extensions we treat as "the actual document" when a search-result page
 # opens onto an HTML wrapper that embeds a link (task req 6a). Matched
@@ -33,7 +33,7 @@ class WrcSpider(scrapy.Spider):
     ``SCRAPER_PARTITION_SIZE`` (monthly / weekly / daily)."""
 
     name = "wrc"
-    allowed_domains = ["workplacerelations.ie"]
+    allowed_domains = ["workplacerelations.ie"] # scrapy drops any request whose url isnt under this domain 
 
     def __init__(
         self,
@@ -73,12 +73,14 @@ class WrcSpider(scrapy.Spider):
         self.partition_http_failures: dict[tuple[str, str], int] = {}
 
     async def start(self):
-        size = settings.scraper.partition_size
+        # monthly 
+        size = settings.scraper.partition_size 
         for body_id in self.body_ids:
             for partition_date, p_start, p_end in iter_partitions(
                 self.range_start, self.range_end, size
             ):
                 url = self._search_url(body_id, p_start, p_end, page=1)
+                # scrapy's object that we yield to scrapy -- yield lets Scrapy start fetching immediately without waiting for all URLs to be generated after the loop finished
                 yield scrapy.Request(
                     url,
                     callback=self.parse_search,
@@ -97,7 +99,7 @@ class WrcSpider(scrapy.Spider):
 
         if meta.get("is_first_page"):
             total = self._parse_total(response)
-            self.partition_totals[(meta["body_name"], meta["partition_date"])] = total
+            self.partition_totals[(meta["body_name"], meta["partition_date"])] = total # self.partition_totals[("Workplace Relations Commission", "2024-01-01")] = 23
             self.logger.info(
                 "partition_started",
                 extra={
@@ -114,6 +116,8 @@ class WrcSpider(scrapy.Spider):
                 total_pages = math.ceil(total / RESULTS_PER_PAGE)
                 body_id = meta["body_id"]
                 # parse dates back from query string so we don't drift on month boundaries
+                # builds a URL for page N by taking the already-constructed page 1 URL and swapping only the pageNumber parameter.
+
                 for page in range(2, total_pages + 1):
                     url = self._search_url_from_first(response.url, page)
                     yield scrapy.Request(
@@ -214,12 +218,13 @@ class WrcSpider(scrapy.Spider):
         content_type = response.headers.get("Content-Type", b"").decode(
             "latin-1", errors="replace"
         )
-
+        # Detect an HTML wrapper page -- is_document_fetch means that this is  asecond hop of parse_detail
         if (
             content_type.lower().startswith("text/html")
             and not response.meta.get("is_document_fetch")
         ):
             doc_href = self._find_document_link(response)
+            # Find and follow the embedded document link
             if doc_href:
                 doc_url = response.urljoin(doc_href)
                 item["doc_url"] = doc_url  # metadata should point at what we actually stored
@@ -246,11 +251,12 @@ class WrcSpider(scrapy.Spider):
                     },
                 )
                 return
-
+        # Store the actual document
         item["content_type"] = content_type
         item["_body_bytes"] = response.body
         yield item
 
+    # pdf is inside an html wrapper so it scans for .pdf/.doc/.docx extensions contained inside _DOC_LINK_SCOPE
     def _find_document_link(self, response) -> str | None:
         """First anchor inside the decision subtree whose URL path ends in
         one of ``_DOCUMENT_EXTS``, or ``None`` if the page is a
@@ -263,6 +269,7 @@ class WrcSpider(scrapy.Spider):
             href = (anchor.attrib.get("href") or "").strip()
             if not href:
                 continue
+            # for <a href="/files/adj-00060437.pdf?version=2">Download</a>
             path_only = href.split("?", 1)[0].split("#", 1)[0].lower()
             if path_only.endswith(_DOCUMENT_EXTS):
                 return href
@@ -278,6 +285,7 @@ class WrcSpider(scrapy.Spider):
         would only be findable via a record_failed grep and the summary would
         leave ``found − scraped`` unaccounted-for.
         """
+        # scrapy wraps the exception that was produced by scrapy.Request into a Twisted failure object 
         request = failure.request
         response = getattr(failure.value, "response", None)
         status = response.status if response is not None else None
@@ -287,6 +295,7 @@ class WrcSpider(scrapy.Spider):
         partition_date = meta.get("partition_date")
         if body_name is not None and partition_date is not None:
             key = (body_name, partition_date)
+            # increments number of failures for each (body x partition)
             self.partition_http_failures[key] = (
                 self.partition_http_failures.get(key, 0) + 1
             )
@@ -315,6 +324,8 @@ class WrcSpider(scrapy.Spider):
             "to": to_site_date(p_end),
         })
         return f"https://www.workplacerelations.ie{SEARCH_PATH}?{qs}"
+    # builds   "https://www.workplacerelations.ie/en/search/?decisions=1&body=3&pageNumber=1&from=2024-01-01&to=2024-01-31"
+
 
     def _search_url_from_first(self, first_page_url: str, page: int) -> str:
         # swap only pageNumber; keeps `from`/`to` verbatim

@@ -19,6 +19,11 @@ key, so Dagster refuses to materialize transform for a partition whose
 ingest hasn't succeeded — the task's "separate tasks with proper dependency
 handling" contract.
 
+OIG advisory opinions are scraped by a separate asset ``oig_landing_records``
+partitioned by **year** (1997–present). One Dagster run = one calendar year;
+the spider fetches all opinions for that year in a single browse request then
+follows each detail page.
+
 Scrapy is invoked as a **subprocess**, not embedded, on purpose: Scrapy
 drives Twisted's reactor which is not restartable within one Python
 process. Subprocessing sidesteps the whole class of "reactor already
@@ -59,6 +64,12 @@ BODY_SLUGS: dict[str, int] = {body_slug(name): bid for bid, name in BODIES.items
 _MONTHLY = dg.MonthlyPartitionsDefinition(start_date=settings.dagster.partition_start_date)
 _BODIES = dg.StaticPartitionsDefinition(sorted(BODY_SLUGS))
 _PARTITIONS = dg.MultiPartitionsDefinition({"date": _MONTHLY, "body": _BODIES})
+
+# OIG opinions are published annually; one partition = one calendar year.
+# 1997 is the earliest year on the OIG browse page.
+_OIG_YEARS = dg.StaticPartitionsDefinition(
+    [str(y) for y in range(1997, date.today().year + 1)]
+)
 
 # Repo root — the folder containing ``scrapy.cfg``. Dagster may launch this
 # code from anywhere (its own workspace, a container WORKDIR), so we resolve
@@ -225,4 +236,73 @@ def _drain_stdout(proc: subprocess.Popen, context) -> None:
         context.log.info(line.rstrip())
 
 
-defs = dg.Definitions(assets=[landing_records, processed_records])
+@dg.asset(
+    partitions_def=_OIG_YEARS,
+    retry_policy=dg.RetryPolicy(
+        max_retries=settings.dagster.landing_max_retries,
+        delay=settings.dagster.landing_retry_delay_sec,
+    ),
+    group_name="oig",
+    description="OIG advisory opinions for one calendar year.",
+)
+def oig_landing_records(context) -> dg.MaterializeResult:
+    """Run the OIG spider for one yearly partition.
+
+    The partition key is the ISO date of the first day of the year
+    (e.g. ``2023-01-01``); we extract the 4-digit year from it and pass
+    it to the spider as ``-a year=YYYY``.
+    """
+    year = int(context.partition_key)
+
+    cmd = [
+        sys.executable, "-m", "scrapy", "crawl", "oig",
+        "-a", f"year={year}",
+    ]
+    context.log.info(f"launching: {' '.join(cmd)} (cwd={_REPO_ROOT})")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "SCRAPY_SETTINGS_MODULE": "wrc_pipeline.scrapers.settings"},
+    )
+
+    reader = threading.Thread(
+        target=_drain_stdout, args=(proc, context), daemon=True,
+    )
+    reader.start()
+
+    subprocess_timeout = settings.dagster.subprocess_timeout_sec
+    try:
+        returncode = proc.wait(timeout=subprocess_timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=5)
+        raise dg.Failure(
+            description=(
+                f"oig spider timed out after {subprocess_timeout}s for year {year}"
+            ),
+        )
+
+    reader.join(timeout=5)
+
+    if returncode != 0:
+        raise dg.Failure(
+            description=(
+                f"oig spider exited with code {returncode} for year {year} "
+                f"— see run log for details"
+            ),
+        )
+
+    return dg.MaterializeResult(metadata={"year": year})
+
+
+defs = dg.Definitions(assets=[landing_records, processed_records, oig_landing_records])

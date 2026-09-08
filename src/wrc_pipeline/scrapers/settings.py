@@ -38,6 +38,7 @@ RETRY_TIMES = _cfg.scraper.retry_times
 # 520–524 origin/edge errors — treating those as terminal record_failed
 # events would strand recoverable records. Retrying lets AutoThrottle
 # back off and the request succeed on a subsequent attempt.
+#  tells Scrapy to automatically retry requests that get these HTTP error responses
 RETRY_HTTP_CODES = [403, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]
 
 # Do NOT let Scrapy reconfigure logging — we own the root handler above.

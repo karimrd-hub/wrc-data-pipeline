@@ -52,7 +52,7 @@ class Parties(BaseModel):
     respondent: Optional[str] = None
     representatives: list[str] = Field(default_factory=list)
 
-
+# type-checks the extractor's output pulled out from the cleaned html 
 class StructuredFields(BaseModel):
     """Best-effort structured extraction — all fields nullable.
 
@@ -60,7 +60,6 @@ class StructuredFields(BaseModel):
     a decision that legitimately has no PARTIES section (rare, e.g.
     procedural rulings) is not an error.
     """
-
     model_config = ConfigDict(extra="allow")
 
     decision_type: Optional[str] = None
@@ -80,6 +79,7 @@ class ProcessedRecord(BaseModel):
     ``processed_metadata``. Fields that vary between HTML and PDF branches
     (``text_file_*``) are optional — the caller decides."""
 
+    # if the extractor passes a field that isn't declared here, keep it instead of rejecting it
     model_config = ConfigDict(extra="allow")
 
     identifier: str
@@ -119,7 +119,7 @@ class ProcessedRecord(BaseModel):
         if not _ISO_DATE.match(v):
             raise ValueError(f"partition date {v!r} not ISO YYYY-MM-DD")
         return v
-
+    # compares file_size against min_content_bytes, which a @field_validator can't do since it only sees one field at a time
     @model_validator(mode="after")
     def _min_size(self) -> "ProcessedRecord":
         if self.file_size < self.min_content_bytes:

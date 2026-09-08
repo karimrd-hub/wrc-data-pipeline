@@ -165,7 +165,7 @@ def _visible_text(soup: BeautifulSoup) -> str:
 
 
 def _parties(host: Tag | None) -> dict:
-    """Split the PARTIES block on the ``AND`` divider paragraph.
+    """extract parties then _split_parties splits the PARTIES block on the ``AND`` divider paragraph.
 
     Bold paragraphs before ``AND`` = complainant lines, after = respondent
     lines. ``(REPRESENTED BY …)`` fragments are stripped from names and
@@ -185,7 +185,7 @@ def _parties(host: Tag | None) -> dict:
             lines.append(text)
     return _split_parties(lines)
 
-
+# everything before "AND" is complainant but everything after it is respondant
 def _split_parties(lines: list[str]) -> dict:
     complainant: list[str] = []
     respondent: list[str] = []
@@ -260,7 +260,7 @@ def _decision_type(subject_text: str, body_text: str) -> str | None:
                 return label
     return None
 
-
+#  Scans the text for phrases like "hearing took place on", grabs the 60 characters after, parses  whatever date is there
 def _hearing_date(body_text: str) -> str | None:
     """Parse the hearing date out of "hearing took place on ..." style
     phrasings. Returns ISO ``YYYY-MM-DD`` on hit, ``None`` otherwise."""
@@ -345,7 +345,7 @@ def _monetary_amounts(body_text: str) -> list[float]:
 # Date parsing
 # ---------------------------------------------------------------------------
 
-
+#  "14 March 2023" → date(2023, 3, 14)
 def _parse_any_date(text: str) -> date | None:
     m = _LONG_DATE.search(text)
     if m:
@@ -357,12 +357,12 @@ def _parse_any_date(text: str) -> date | None:
             return None
     return _parse_short_date(text)
 
-
+#  "14/03/2023" → date(2023, 3, 14)
 def _parse_short_date(text: str) -> date | None:
     m = _SHORT_DATE.search(text)
     return _short_date_from_match(m)
 
-
+# "14/03/2023 ... 20/05/2023" → date(2023, 5, 20),
 def _last_short_date(text: str) -> date | None:
     last: date | None = None
     for m in _SHORT_DATE.finditer(text):
@@ -371,7 +371,7 @@ def _last_short_date(text: str) -> date | None:
             last = parsed
     return last
 
-
+# re.Match("14", "03", "2023") → date(2023, 3, 14)
 def _short_date_from_match(m: re.Match | None) -> date | None:
     if m is None:
         return None

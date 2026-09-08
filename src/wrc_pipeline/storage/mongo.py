@@ -44,3 +44,9 @@ async def ensure_indexes(collection: AsyncCollection) -> None:
     await collection.create_index([("partition_date", ASCENDING)], name="partition_date_idx")
     await collection.create_index([("file_hash", ASCENDING)], name="file_hash_idx")
     await collection.create_index([("body", ASCENDING)], name="body_idx")
+
+
+async def ensure_oig_indexes(collection: AsyncCollection) -> None:
+    await collection.create_index([("opinion_id", ASCENDING)], unique=True, name="opinion_id_unique")
+    await collection.create_index([("year", ASCENDING)], name="year_idx")
+    await collection.create_index([("status", ASCENDING)], name="status_idx")

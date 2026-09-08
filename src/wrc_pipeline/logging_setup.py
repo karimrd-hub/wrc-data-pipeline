@@ -37,9 +37,11 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
+        # skips python and private attribute only our extra={} keys survive 
         for k, v in record.__dict__.items():
             if k not in _RESERVED and not k.startswith("_"):
                 payload[k] = v
+        # if the record contains exception info we attach the exception to the record 
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str, ensure_ascii=False)
@@ -67,6 +69,7 @@ def install_json_root_logging(level: int | str = "INFO") -> None:
         root.removeHandler(h)
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    # handler.setLevel(lvl) to allow logging level to be INFO 
     root.addHandler(handler)
     root.setLevel(lvl)
     root._wrc_json_configured = True  # type: ignore[attr-defined]

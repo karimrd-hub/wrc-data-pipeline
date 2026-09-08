@@ -68,6 +68,7 @@ def iter_partitions(start: date, end: date, size: str) -> Iterator[Partition]:
         ) from None
     if end < start:
         return iter(())
+    #  calls the selected generator function with the date range and returns its iterator to the caller
     return gen(start, end)
 
 

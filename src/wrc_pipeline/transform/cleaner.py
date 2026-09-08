@@ -104,6 +104,7 @@ def _prune(root: Tag) -> None:
     for selector in _STRIP_SELECTORS:
         for tag in root.select(selector):
             tag.decompose()
+    # HTML comments
     for comment in root.find_all(string=lambda s: isinstance(s, Comment)):
         comment.extract()
     for p in root.find_all("p"):
@@ -118,6 +119,7 @@ def _escape(text: str) -> str:
     # Minimal HTML escape for the identifier landing in <title>. Identifiers
     # in the wild (``TED2616``, ``ADJ-00027821``) never contain these chars,
     # but escaping is defensive.
+    # <title>A < B & C</title> becomes <title>A &lt; B &amp; C</title>
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
